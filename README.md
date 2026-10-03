@@ -65,7 +65,7 @@ Together, Ollama, LM Studio, llama.cpp server, vLLM…
 ### One-liner (Termux / Linux / macOS)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Anon4You/Laudacode/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/danz565/Laudacode/main/install.sh | sh
 ```
 
 Installs the **latest GitHub release** (auto-detected), builds it on-device and
@@ -77,7 +77,7 @@ puts `laudacode` in `$PREFIX/bin` — no sudo inside Termux. Needs `curl`, `tar`
 
 ```sh
 pkg update && pkg install rust git -y
-git clone https://github.com/Anon4You/Laudacode.git
+git clone https://github.com/danz565/Laudacode.git
 cd Laudacode
 cargo build --release
 cp target/release/laudacode $PREFIX/bin/
