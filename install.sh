@@ -1,7 +1,7 @@
 #!/bin/sh
 # Laudacode installer — Termux, Linux and macOS. No sudo inside Termux.
 #
-#   curl -fsSL https://raw.githubusercontent.com/Anon4You/Laudacode/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/danz565/Laudacode/main/install.sh | sh
 #
 # Tries a prebuilt release binary for your platform first (fast, no rust
 # needed); falls back to building from source if no asset matches.
