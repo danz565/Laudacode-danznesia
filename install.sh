@@ -30,15 +30,19 @@ for tool in curl tar; do
     }
 done
 
-# --- resolve latest release ---------------------------------------------------------
+# --- resolve version ---------------------------------------------------------------
 if [ -n "${LAUDACODE_VERSION:-}" ]; then
     VERSION="$LAUDACODE_VERSION"
+elif [ "${FORCE_BUILD:-0}" = "1" ]; then
+    VERSION=""
 else
     echo "==> resolving latest release"
     VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
         | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)"
+
     [ -n "$VERSION" ] || {
-        echo "✗ could not get latest version from GitHub — set LAUDACODE_VERSION=vX.Y.Z manually" >&2
+        echo "✗ could not get latest release from GitHub" >&2
+        echo "  Use LAUDACODE_VERSION=<tag> or FORCE_BUILD=1" >&2
         exit 1
     }
 fi
