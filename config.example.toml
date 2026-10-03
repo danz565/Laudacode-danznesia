@@ -1,0 +1,214 @@
+# Laudacode example configuration
+# Copy to ~/.config/laudacode/config.toml and edit.
+# Environment variables (OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL)
+# override the active provider's values.
+
+# Which provider to use by default
+active_provider = "openrouter"
+
+# Default approval mode: suggest | auto-edit | full-auto (default: auto-edit)
+approval_mode = "auto-edit"
+
+# Reasoning depth for reasoning-capable models (set at runtime with
+# /reasoning — normal · low · medium · high · max). None = model default.
+# model_reasoning_effort = "high"
+
+# Assumed context window in tokens. Drives the "ctx left" meter and the
+# auto-compact threshold (80% of this). Omit to use a per-model default.
+# context_window = 128000
+
+# Structured JSONL log of tool calls, token usage, hook results and budget
+# blocks. Off unless `enabled = true`; prompts and file contents are never
+# written, so the log stays safe to share. With no `file` the events go to
+# stderr; set one to write them to disk instead.
+# [logging]
+# enabled = true
+# file    = "~/.local/share/laudacode/session.jsonl"   # `~` is expanded
+
+# Session guardrails. Both are cumulative for the whole conversation; hitting
+# either stops the turn with an error instead of silently burning tokens.
+# [limits]
+# max_tokens  = 500000
+# max_cost_usd = 5.0
+
+# How many times a failed provider request is retried before the turn gives
+# up. Retries cover dropped connections and 408/409/429/5xx responses, and
+# honor the server's `Retry-After` header when it sends one. A bad key or a
+# malformed request still fails immediately — retrying those is pointless.
+# Omit this to get the default of 5 retries (6 attempts per request); set 0 to
+# disable retries entirely. Clamped to 20.
+# max_retries = 5
+
+# Per-model prices in USD per 1M tokens, used to turn usage into the dollar
+# figure behind `max_cost_usd`. Only needed to correct or extend the built-in
+# table; anything not listed falls back to it. The key matches any substring of
+# the model name, so `claude-sonnet-4` covers `anthropic/claude-sonnet-4` too.
+# ponytail: these are guardrail estimates, not billing.
+# [pricing."anthropic/claude-sonnet-4"]
+# input  = 3.0
+# output = 15.0
+
+# Commands run after every file-mutating tool call (edit_file, write_file,
+# apply_patch). They receive the touched paths in $LAUDACODE_CHANGED_FILES
+# (space-separated) and their exit status plus first output line is reported
+# back to the model, so a failing formatter or test run gets fixed instead of
+# ignored. Keep them fast — a 30s timeout applies to each.
+# [hooks]
+# post_edit = ["cargo fmt", "cargo clippy --quiet -- -D warnings"]
+# post_edit_timeout_secs = 30
+
+# Transport tuning for every outgoing request (model calls, fetch_url, web
+# search). Applied once at startup, so all clients share it.
+# [network]
+# proxy     = "http://127.0.0.1:8080"        # http/https/socks5
+# ca_bundle = "~/.config/laudacode/corp.pem" # extra trusted roots (PEM)
+# insecure  = false                           # skip TLS verification (risky)
+
+[providers.tokenrouter]
+base_url = "https://api.tokenrouter.com/v1"
+api_key  = "tr-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+model    = "gpt-4o-mini"
+
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+api_key  = "sk-or-v1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+model    = "stealth/ox-alpha"
+
+[providers.openai]
+base_url = "https://api.openai.com/v1"
+api_key  = "sk-xxxxxxxxxxxxxxxxxxxxxxxx"
+model    = "gpt-4o-mini"
+
+# Anthropic exposes an OpenAI-compatible layer:
+# https://api.anthropic.com/v1 (use a Claude model id + Anthropic key)
+[providers.anthropic]
+base_url = "https://api.anthropic.com/v1"
+api_key  = "sk-ant-xxxxxxxxxxxxxxxxxxxxxxxx"
+model    = "claude-sonnet-4-5"
+
+[providers.groq]
+base_url = "https://api.groq.com/openai/v1"
+api_key  = "gsk_xxxxxxxxxxxxxxxx"
+model    = "llama-3.3-70b-versatile"
+
+[providers.deepseek]
+base_url = "https://api.deepseek.com/v1"
+api_key  = "sk-xxxxxxxxxxxxxxxx"
+model    = "deepseek-chat"
+
+[providers.xai]
+base_url = "https://api.x.ai/v1"
+api_key  = "xai-xxxxxxxxxxxxxxxxxxxxxxxx"
+model    = "grok-4"
+
+[providers.mistral]
+base_url = "https://api.mistral.ai/v1"
+api_key  = "xxxxxxxxxxxxxxxxxxxxxxxx"
+model    = "mistral-large-latest"
+
+[providers.cerebras]
+base_url = "https://api.cerebras.ai/v1"
+api_key  = "csk-xxxxxxxxxxxxxxxxxxxxxxxx"
+model    = "llama3.3-70b"
+
+[providers.moonshot]
+base_url = "https://api.moonshot.ai/v1"
+api_key  = "sk-xxxxxxxxxxxxxxxx"
+model    = "kimi-k2-0905-preview"
+
+# Z.AI (Zhipu GLM models)
+[providers.zai]
+base_url = "https://api.z.ai/api/paas/v4"
+api_key  = "xxxxxxxxxxxxxxxx.xxxxxxxxxxxx"
+model    = "glm-4.6"
+
+[providers.novita]
+base_url = "https://api.novita.ai/v3/openai"
+api_key  = "sk_xxxxxxxxxxxxxxxxxxxxxxxx"
+model    = "deepseek/deepseek-v3-turbo"
+
+[providers.chutes]
+base_url = "https://llm.chutes.ai/v1"
+api_key  = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+model    = "deepseek/deepseek-r1"
+
+[providers.ollama]
+base_url = "http://localhost:11434/v1"
+api_key  = "ollama"
+model    = "qwen2.5-coder:7b"
+
+[providers.ollamacloud]
+base_url = "https://ollama.com/v1"
+api_key  = "ollama-xxxxxxxxxxxxxxxx"
+model    = "qwen3-coder:32b"
+
+# ── Built-in free providers (no API key, kind set to the adapter) ──────────
+# These are prefilled by /provider add under powerbrain / aitopia. Picking
+# the preset stores the correct `kind` automatically. powerbrain is also the
+# built-in default used when no provider is configured at all.
+
+[providers.aitopia]
+base_url   = "https://extensions.aitopia.ai/ai/send"
+api_key    = ""
+kind       = "aitopia"
+model      = "AITOPIA"          # gpt-4o-mini class model
+
+[providers.powerbrain]
+base_url   = "https://powerbrainai.com/app/backend/api/api.php"
+api_key    = ""
+kind       = "powerbrain"
+model      = "gpt-5"
+
+# Custom headers per provider (e.g. OpenRouter ranking headers):
+# [providers.openrouter.headers]
+# "HTTP-Referer" = "https://github.com/Anon4You/Laudacode"
+# "X-Title"      = "Laudacode"
+
+# Named bundles of provider overrides, selected with --profile:
+# [profiles.fast]
+# model = "stealth/ox-alpha"
+# reasoning_effort = "low"
+
+# External tool servers (Model Context Protocol, stdio transport only).
+# Each entry spawns a subprocess and exposes its tools to the model as
+# `mcp__<server>__<tool>`. Check status with `/mcp`.
+#
+# [mcp_servers.files]
+# command     = "mcp-server-filesystem"
+# args        = ["--root", "."]
+# env         = { API_KEY = "..." }
+# cwd         = "."            # relative to the agent's directory
+# enabled     = true           # set false to keep config but skip startup
+# timeout_secs = 60            # per-request budget; 0 = default (60s)
+# plan        = false          # opt in to use these tools in PLAN (read-only) mode
+#
+# MCP tools are third-party code whose effects Laudacode cannot inspect, so
+# they are treated as needing consent in BUILD mode. Deny or prompt for
+# individual tools with a permission rule:
+#
+# [permission.mcp]
+# "mcp__files__delete" = "deny"
+# "mcp__*"             = "ask"
+
+# Language servers (LSP, stdio transport only). Each entry claims file
+# extensions and maps them to the LSP `languageId` that server expects.
+# Check status with `/lsp`. The `lsp` tool and the post-edit diagnostics
+# pass both use these.
+#
+# [lsp_servers.rust]
+# command  = "rust-analyzer"
+# filetypes = { rs = "rust" }
+#
+# [lsp_servers.c]
+# command  = "clangd"
+# filetypes = { c = "c", h = "c" }
+# diagnostics_secs = 5   # how long to wait for diagnostics to settle
+#
+# `languageId` is server-specific, so the mapping is explicit rather than
+# guessed from the extension. Two servers claiming one extension is rejected
+# at load time. Diagnostics are only *awaited* for this long: analysis is
+# often still running, and the result says so instead of claiming a clean
+# file. Queries obey your read rules:
+#
+# [permission.read]
+# "src/**" = "allow"

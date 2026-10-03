@@ -1,0 +1,4971 @@
+use anyhow::{bail, Context, Result};
+use crossterm::style::Stylize;
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
+
+use crate::agent::{Agent, AgentEvent, ApprovalMode, UiSink};
+use crate::api::{ChatClient, Message};
+use crate::budget;
+use crate::config::{sanitize_name, ActiveProvider, Config, Provider};
+use crate::session::Session;
+use crate::tools::{self, Action};
+use crate::tui::{self as tuiapp, Action as KeyAction, Entry, Tui};
+
+// ---------------------------------------------------------------------------
+// Plain terminal UI sink (used by `exec` mode)
+// ---------------------------------------------------------------------------
+
+/// Interpret an approval answer. `None` = unrecognised, re-prompt.
+///
+/// Enter and EOF are a **deny**. An empty line must never approve a
+/// destructive action, and on a closed stdin `read_line` returns `Ok(0)`
+/// with an untouched buffer — so `""` is precisely the EOF case.
+fn parse_yes_no(line: &str) -> Option<bool> {
+    match line.trim().to_lowercase().as_str() {
+        "y" | "yes" => Some(true),
+        "" | "n" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+pub struct TermUi {
+    pub rl: DefaultEditor,
+    approve_all: bool,
+    in_reasoning: bool,
+    reasoning_bytes: usize,
+    /// `--json`: emit machine-readable event lines instead of prose.
+    pub json_out: bool,
+    /// `--quiet`: suppress brand chrome (banner + identity block) so stdout
+    /// carries results only.
+    pub quiet: bool,
+}
+
+impl TermUi {
+    pub fn new() -> Result<Self> {
+        let rl = DefaultEditor::new()?;
+        Ok(Self {
+            rl,
+            approve_all: false,
+            in_reasoning: false,
+            reasoning_bytes: 0,
+            json_out: false,
+            quiet: false,
+        })
+    }
+
+    fn emit_json(kind: &str, data: &str) {
+        let obj = serde_json::json!({ "type": kind, "data": data });
+        println!("{obj}");
+    }
+
+    pub fn begin_turn(&mut self) {
+        self.in_reasoning = false;
+        self.reasoning_bytes = 0;
+    }
+
+    pub fn end_turn(&mut self) {
+        println!();
+    }
+}
+
+impl UiSink for TermUi {
+    fn on_event(&mut self, ev: AgentEvent) {
+        if self.json_out {
+            match ev {
+                AgentEvent::Content(d) => Self::emit_json("content", &d),
+                AgentEvent::Reasoning(d) => Self::emit_json("reasoning", &d),
+                AgentEvent::ToolStart { name, summary } => {
+                    let obj = serde_json::json!({ "type": "tool_start", "tool": name, "detail": summary });
+                    println!("{obj}");
+                }
+                AgentEvent::ToolDone { name, ok, preview } => {
+                    let obj = serde_json::json!({ "type": "tool_done", "tool": name, "ok": ok, "preview": preview });
+                    println!("{obj}");
+                }
+                AgentEvent::ToolEdit { name, files } => {
+                    let obj =
+                        serde_json::json!({ "type": "tool_edit", "tool": name, "files": files });
+                    println!("{obj}");
+                }
+                AgentEvent::Usage(u) => {
+                    let obj = serde_json::json!({
+                        "type": "usage",
+                        "prompt_tokens": u.prompt_tokens,
+                        "completion_tokens": u.completion_tokens,
+                        "total_tokens": u.total_tokens,
+                    });
+                    println!("{obj}");
+                }
+                AgentEvent::Todo(todos) => {
+                    let obj = serde_json::json!({ "type": "plan", "steps": todos });
+                    println!("{obj}");
+                }
+                AgentEvent::Notice(msg) => {
+                    let obj = serde_json::json!({ "type": "notice", "message": msg });
+                    println!("{obj}");
+                }
+            }
+            return;
+        }
+        match ev {
+            AgentEvent::Content(delta) => {
+                let mut sep = String::new();
+                if self.in_reasoning {
+                    sep.push('\n');
+                    self.in_reasoning = false;
+                }
+                print!("{sep}{delta}");
+                let _ = std::io::stdout().flush();
+            }
+            AgentEvent::Reasoning(delta) => {
+                if !self.in_reasoning {
+                    print!("{}", "· thinking".dark_grey());
+                    self.in_reasoning = true;
+                    self.reasoning_bytes = 0;
+                }
+                self.reasoning_bytes += delta.len();
+                if self.reasoning_bytes / 600 > (self.reasoning_bytes - delta.len()) / 600 {
+                    print!("{}", ".".dark_grey());
+                    let _ = std::io::stdout().flush();
+                }
+            }
+            AgentEvent::ToolStart { name, summary } => {
+                println!("{}", format!("· {name}: {summary}").dark_grey());
+                let _ = std::io::stdout().flush();
+            }
+            AgentEvent::Notice(msg) => {
+                println!("{}", format!("· {msg}").yellow());
+                let _ = std::io::stdout().flush();
+            }
+            AgentEvent::ToolEdit { name, files } => {
+                use crossterm::style::{Color as CT, Stylize as _};
+                for f in &files {
+                    println!(
+                        "{}",
+                        format!("┌─ {} (+{} −{})", f.path, f.added, f.removed)
+                            .with(CT::Cyan)
+                            .bold()
+                    );
+                    for l in &f.lines {
+                        let line = match l.kind {
+                            crate::diff::LineKind::Add => l.text.clone().with(CT::Green),
+                            crate::diff::LineKind::Del => l.text.clone().with(CT::Red),
+                            crate::diff::LineKind::Meta => {
+                                format!("  {text}", text = l.text).with(CT::Blue).italic()
+                            }
+                            crate::diff::LineKind::Ctx => {
+                                l.text.clone().dark_grey().to_string().dark_grey()
+                            }
+                        };
+                        println!("│{line}");
+                    }
+                    println!("{}", "└─".with(CT::Cyan));
+                }
+                let _ = name; // header already shows the tool via ToolStart
+                let _ = std::io::stdout().flush();
+            }
+            AgentEvent::ToolDone { ok: false, .. } => {
+                println!("{}", "✗ failed".red().bold());
+                let _ = std::io::stdout().flush();
+            }
+            AgentEvent::ToolDone { ok: true, .. } => {}
+            _ => {}
+        }
+    }
+
+    fn fork(&mut self, prefix: &str) -> Box<dyn UiSink> {
+        Box::new(TermSubUi {
+            prefix: prefix.to_string(),
+        })
+    }
+
+    /// MCP tools are third-party code, so "always" does not cover them the
+    /// way it does for local Moderate actions: a server can do anything, and
+    /// the user is unlikely to have read what it does.
+    fn approve_mcp(&mut self, _name: &str, summary: &str) -> bool {
+        println!(
+            "{}{}{}",
+            "? ".yellow().bold(),
+            "Laudacode wants to call: ".bold(),
+            summary
+        );
+        loop {
+            match self.rl.readline("[y]es  [n]o: ") {
+                Ok(l) => match parse_yes_no(&l) {
+                    Some(ok) => return ok,
+                    None => println!("{}", "  please answer y or n".dark_grey()),
+                },
+                // EOF or a closed stdin is not consent.
+                Err(_) => return false,
+            }
+        }
+    }
+
+    fn approve(&mut self, action: &Action, danger: tools::Danger) -> bool {
+        if self.approve_all && danger != tools::Danger::High {
+            return true;
+        }
+        let desc = if danger == tools::Danger::High {
+            format!("{}{}", action.describe(), " [DANGEROUS]".red().bold())
+        } else {
+            action.describe()
+        };
+        println!(
+            "{}{}{}",
+            "? ".yellow().bold(),
+            "Laudacode wants to: ".bold(),
+            desc
+        );
+        loop {
+            match self.rl.readline("[y]es  [n]o  [a]lways: ") {
+                Ok(line) => match line.trim().to_lowercase().as_str() {
+                    "a" | "always" => {
+                        self.approve_all = true;
+                        println!(
+                            "{}",
+                            "  auto-approving for the rest of this session".dark_grey()
+                        );
+                        return true;
+                    }
+                    other => match parse_yes_no(other) {
+                        Some(ok) => return ok,
+                        None => continue,
+                    },
+                },
+                Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => return false,
+                Err(_) => return false,
+            }
+        }
+    }
+}
+
+/// Plain-text sink for one sub-agent in exec mode — prefixes every event so
+/// concurrent specialists stay attributable on a dumb terminal.
+struct TermSubUi {
+    prefix: String,
+}
+
+impl UiSink for TermSubUi {
+    fn on_event(&mut self, ev: AgentEvent) {
+        match ev {
+            AgentEvent::Content(d) => print!("{}{d}", format!("{} ", self.prefix).dark_grey()),
+            AgentEvent::ToolStart { name, summary } => {
+                println!(
+                    "{}",
+                    format!("· {prefix}{name}: {summary}", prefix = self.prefix).dark_grey()
+                );
+            }
+            AgentEvent::Notice(msg) => {
+                println!(
+                    "{}",
+                    format!("· {prefix}{msg}", prefix = self.prefix).yellow()
+                );
+            }
+            AgentEvent::ToolEdit { files, .. } => {
+                use crossterm::style::{Color as CT, Stylize as _};
+                for f in &files {
+                    println!(
+                        "{}",
+                        format!(
+                            "┌─ [{p}] {path} (+{a} −{r})",
+                            p = self.prefix,
+                            path = f.path,
+                            a = f.added,
+                            r = f.removed
+                        )
+                        .with(CT::Cyan)
+                    );
+                }
+            }
+            AgentEvent::ToolDone { ok: false, .. } => println!("{}", "✗ failed".red().bold()),
+            _ => {}
+        }
+        let _ = std::io::stdout().flush();
+    }
+
+    fn approve(&mut self, action: &Action, danger: tools::Danger) -> bool {
+        // Sub-agent approvals in exec mode: plain stdin prompt.
+        println!(
+            "{}{}{}",
+            "? ".yellow().bold(),
+            format!("[{}] wants to: ", self.prefix).bold(),
+            action.describe()
+        );
+        if danger == tools::Danger::High {
+            println!("{}", "  [DANGEROUS]".red().bold());
+        }
+        let mut line = String::new();
+        loop {
+            print!("[y]es / [n]o: ");
+            let _ = std::io::stdout().flush();
+            // `Ok(0)` is EOF, not an empty answer: deny. Without this a closed
+            // or exhausted stdin silently approved every sub-agent action.
+            match std::io::stdin().read_line(&mut line) {
+                Ok(0) | Err(_) => return false,
+                Ok(_) => {}
+            }
+            match parse_yes_no(&line) {
+                Some(ok) => return ok,
+                None => {
+                    line.clear();
+                    println!("{}", "  please answer y or n".dark_grey());
+                }
+            }
+        }
+    }
+
+    fn fork(&mut self, prefix: &str) -> Box<dyn UiSink> {
+        Box::new(TermSubUi {
+            prefix: format!("{}>{prefix}", self.prefix),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Agent worker thread (the UI never blocks on the agent)
+// ---------------------------------------------------------------------------
+
+/// Events flowing from the worker thread to the TUI.
+/// Flat `"label · detail"` strings into structured rows, so a picker that
+/// has nothing interesting to say still renders with the same layout.
+fn rows(items: Vec<String>) -> Vec<crate::tui::PickerRow> {
+    items
+        .iter()
+        .map(|s| crate::tui::PickerRow::parse(s))
+        .collect()
+}
+
+#[derive(Debug)]
+pub enum WorkerEvent {
+    Ev(AgentEvent),
+    /// Modal approval request; worker blocks until an answer arrives.
+    NeedApproval(String),
+    /// Worker started/stopped processing a command.
+    Busy(bool),
+    Info(String),
+    Error(String),
+    /// Conversation was replaced (resume) — TUI must clear its transcript
+    /// and replay the restored messages under the new session identity.
+    Reload {
+        text: String,
+        entries: Vec<Entry>,
+        session_id: String,
+        session_name: Option<String>,
+    },
+    /// Final state sent right before the worker exits, so the shell
+    /// goodbye can offer an exact `--resume <id>` command.
+    SessionSummary {
+        id: String,
+        messages: usize,
+    },
+    /// Generic picker: model lists, resume lists, approval modes…
+    /// Rows are structured so the list can show a label, dimmed context and a
+    /// status chip instead of one flat line.
+    Pick {
+        title: String,
+        items: Vec<crate::tui::PickerRow>,
+    },
+    /// The active endpoint changed (model switch, provider switch or a fresh
+    /// `/provider add`) — the dashboard must re-render model/provider.
+    ProviderSwitched {
+        provider: String,
+        model: String,
+    },
+    /// The current session got (re)named — dashboard shows it live.
+    SessionName(String),
+    /// A session was deleted — a status line can confirm it.
+    SessionDeleted(String),
+    /// Authenticated catalog fetch failed during `/provider add` — the UI
+    /// switches to manual model-name capture instead of a picker.
+    SetupModelsFailed,
+}
+
+/// Commands flowing from the TUI to the worker thread.
+pub enum WorkerCmd {
+    Submit(String),
+    Retry,
+    Compact,
+    Clear,
+    ListModels,
+    SetModel(String),
+    /// Set or clear the reasoning-effort hint (None = model default).
+    SetReasoning(Option<String>),
+    UseProvider(String),
+    SetApprovalMode(ApprovalMode),
+    Export,
+    InitAgentsMd,
+    ListProviders,
+    ShowProvider,
+    Status,
+    /// Report configured MCP servers: connected, failed, or disabled.
+    Mcp,
+    /// Report configured language servers and the file types they own.
+    Lsp,
+    ListSkills,
+    Diff,
+    /// Run the reviewer specialist over uncommitted git changes.
+    Review,
+    /// Open the /resume picker with recent sessions.
+    ListSessions,
+    /// Revert file changes made during the most recent agent turn.
+    Undo(usize),
+    /// Replace the live conversation with a stored session id.
+    ResumeSession(String),
+    /// Snapshot the live conversation as a branch point (`/checkpoint`).
+    Checkpoint(Option<String>),
+    /// List this session's checkpoints (`/checkpoints`).
+    ListCheckpoints,
+    /// Branch a new session from a checkpoint and switch to it (`/branch`).
+    BranchCheckpoint(String),
+    /// Rename the current session.
+    RenameSession(String),
+    /// List sessions matching a keyword (id or name) as a picker.
+    ListSessionsByKeyword(String),
+    /// Actually delete a session by id or name.
+    DeleteSession(String),
+    /// Attach a local image to the next submitted prompt.
+    QueueImage(String),
+    /// Authenticated model-catalog fetch for `/provider add` (key already
+    /// captured). Replies with a models picker or SetupModelsFailed.
+    SetupListModels {
+        base_url: String,
+        api_key: String,
+    },
+    /// Persist + activate a provider created by the in-TUI `/provider add`.
+    FinishProviderSetup {
+        name: String,
+        base_url: String,
+        model: String,
+        api_key: String,
+    },
+    /// Open a picker of configured providers (`use` or `edit` intent).
+    PickProvider(ProviderMenu),
+    /// Fetch the catalog for a configured provider so the user can re-pick
+    /// its model (`/provider edit`).
+    EditProviderPickModel(String),
+    /// Persist a new default model for a configured provider.
+    EditProviderSetModel {
+        provider: String,
+        model: String,
+    },
+    /// Replace the stored API key of a configured provider.
+    FinishEditApiKey {
+        provider: String,
+        api_key: String,
+    },
+    /// Persist the chosen color theme.
+    SetTheme(String),
+    /// Persist the chosen ambient effect.
+    SetEffect(String),
+    Quit,
+}
+
+/// Intent behind the configured-provider picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderMenu {
+    Use,
+    Edit,
+}
+
+/// Extra entry shown at the top of every model picker — catalogs lag behind
+/// reality (hidden/experimental models like `stealth/ox-alpha` work by id
+/// long before they appear in /models), so typing an id must always win.
+pub const MANUAL_MODEL_ITEM: &str = "(+ type a model name instead)";
+
+#[derive(Clone)]
+struct WorkerBridge {
+    tx: Sender<WorkerEvent>,
+    approve_rx: Arc<std::sync::Mutex<Receiver<bool>>>,
+    #[allow(dead_code)]
+    cancel: Arc<AtomicBool>,
+}
+
+impl UiSink for WorkerBridge {
+    fn on_event(&mut self, ev: AgentEvent) {
+        let _ = self.tx.send(WorkerEvent::Ev(ev));
+    }
+
+    fn approve(&mut self, action: &Action, danger: tools::Danger) -> bool {
+        let mut desc = action.describe();
+        if danger == tools::Danger::High {
+            desc.push_str("  [DANGEROUS]");
+        }
+        let _ = self.tx.send(WorkerEvent::NeedApproval(desc));
+        matches!(self.approve_rx.lock().unwrap().recv(), Ok(true))
+    }
+
+    fn approve_mcp(&mut self, _name: &str, summary: &str) -> bool {
+        let _ = self
+            .tx
+            .send(WorkerEvent::NeedApproval(format!("{summary}  [MCP]")));
+        matches!(self.approve_rx.lock().unwrap().recv(), Ok(true))
+    }
+
+    /// Each concurrent sub-agent gets its own bridge sharing the same
+    /// channels; approval requests queue up in the single TUI modal.
+    fn fork(&mut self, prefix: &str) -> Box<dyn UiSink> {
+        Box::new(SubBridge {
+            inner: WorkerBridge {
+                tx: self.tx.clone(),
+                approve_rx: self.approve_rx.clone(),
+                cancel: self.cancel.clone(),
+            },
+            prefix: format!("[{prefix}] "),
+        })
+    }
+}
+
+/// A forked [`WorkerBridge`] tagging events with the sub-agent's name.
+struct SubBridge {
+    inner: WorkerBridge,
+    prefix: String,
+}
+
+impl UiSink for SubBridge {
+    fn on_event(&mut self, ev: AgentEvent) {
+        let tagged = match ev {
+            AgentEvent::ToolStart { name, summary } => AgentEvent::ToolStart {
+                name: format!("{}{}", self.prefix, name),
+                summary,
+            },
+            AgentEvent::ToolDone { name, ok, preview } => AgentEvent::ToolDone {
+                name: format!("{}{}", self.prefix, name),
+                ok,
+                preview,
+            },
+            other => other,
+        };
+        let _ = self.inner.tx.send(WorkerEvent::Ev(tagged));
+    }
+
+    fn approve(&mut self, action: &Action, danger: tools::Danger) -> bool {
+        self.inner.approve(action, danger)
+    }
+
+    fn fork(&mut self, prefix: &str) -> Box<dyn UiSink> {
+        self.inner.fork(prefix)
+    }
+}
+
+pub struct WorkerHandle {
+    pub cmd: Sender<WorkerCmd>,
+    pub approve: Sender<bool>,
+    pub events: Receiver<WorkerEvent>,
+    pub cancel: Arc<AtomicBool>,
+}
+
+/// Move `App` onto a dedicated thread that owns the agent and answers
+/// commands from the TUI. Keeps the UI responsive during streaming and lets
+/// Esc interrupt a running turn.
+pub fn spawn_worker(app: App) -> WorkerHandle {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
+    let (ev_tx, ev_rx) = mpsc::channel::<WorkerEvent>();
+    let (approve_tx, approve_rx) = mpsc::channel::<bool>();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+
+    std::thread::Builder::new()
+        .name("laudacode-agent".into())
+        .spawn(move || worker_main(app, ev_tx, cmd_rx, approve_rx, worker_cancel))
+        .expect("spawning agent worker thread");
+
+    WorkerHandle {
+        cmd: cmd_tx,
+        approve: approve_tx,
+        events: ev_rx,
+        cancel,
+    }
+}
+
+fn worker_main(
+    mut app: App,
+    ev_tx: Sender<WorkerEvent>,
+    cmd_rx: Receiver<WorkerCmd>,
+    approve_rx: Receiver<bool>,
+    cancel: Arc<AtomicBool>,
+) {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            let _ = ev_tx.send(WorkerEvent::Error(format!("building runtime: {e}")));
+            return;
+        }
+    };
+    let approve_rx = Arc::new(std::sync::Mutex::new(approve_rx));
+    let mut last_task: Option<String> = None;
+    // MCP servers must be connected before the first turn — the model can only
+    // call tools it was shown. This has to run on *this* runtime: the stderr
+    // drain is a spawned task, and a throwaway runtime would cancel it.
+    // Failures are reported, never fatal; one dead server must not stop the
+    // session.
+    for f in rt.block_on(app.agent.connect_mcp_servers()) {
+        let _ = ev_tx.send(WorkerEvent::Error(format!("MCP server failed: {f}")));
+    }
+    // Language servers are started eagerly for the same reason, and because a
+    // cold rust-analyzer needs a long time to index: better spent warming now
+    // than stalling the first edit of the session.
+    for f in rt.block_on(app.agent.connect_lsp_servers()) {
+        let _ = ev_tx.send(WorkerEvent::Error(format!("LSP server failed: {f}")));
+    }
+    // Images queued via /image or the -i flag — consumed by the next Submit.
+    let mut pending_images: Vec<String> = std::mem::take(&mut app.pending_images);
+
+    for cmd in cmd_rx {
+        match cmd {
+            WorkerCmd::Quit => {
+                // Flush state and tell the host how to resume this session.
+                app.persist();
+                let _ = ev_tx.send(WorkerEvent::SessionSummary {
+                    id: app.session.id.clone(),
+                    messages: app
+                        .agent
+                        .messages
+                        .iter()
+                        .filter(|m| m.role != "system")
+                        .count(),
+                });
+                break;
+            }
+            WorkerCmd::Submit(text) => {
+                if let Some(memory) = text.strip_prefix('#') {
+                    match add_memory(&app.cwd, memory) {
+                        Ok(msg) => {
+                            let _ = ev_tx.send(WorkerEvent::Info(msg));
+                        }
+                        Err(e) => {
+                            let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                        }
+                    }
+                    continue;
+                }
+                if let Some(shell_cmd) = text.strip_prefix('!') {
+                    run_passthrough_shell(&app, &rt, &ev_tx, shell_cmd);
+                    continue;
+                }
+                // Persist for ↑/↓ recall in future sessions.
+                append_prompt_history(&text);
+                last_task = Some(text.clone());
+                let images = std::mem::take(&mut pending_images);
+                run_agent_turn(&mut app, &rt, &ev_tx, &approve_rx, &cancel, &text, &images);
+            }
+            WorkerCmd::Retry => match last_task.clone() {
+                Some(task) => {
+                    run_agent_turn(&mut app, &rt, &ev_tx, &approve_rx, &cancel, &task, &[]);
+                }
+                None => {
+                    let _ = ev_tx.send(WorkerEvent::Info("nothing to retry yet".into()));
+                }
+            },
+            WorkerCmd::Compact => {
+                let _ = ev_tx.send(WorkerEvent::Busy(true));
+                match rt.block_on(app.agent.compact()) {
+                    Ok(s) => {
+                        app.persist();
+                        let preview: String = s.chars().take(400).collect();
+                        let _ =
+                            ev_tx.send(WorkerEvent::Info(format!("context compacted:\n{preview}")));
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(WorkerEvent::Error(e.to_string()));
+                    }
+                }
+                let _ = ev_tx.send(WorkerEvent::Busy(false));
+            }
+            WorkerCmd::Clear => {
+                let system = app.agent.messages.first().and_then(|m| m.content.clone());
+                app.agent.messages.clear();
+                if let Some(sys) = system {
+                    app.agent.messages.push(Message::system(sys));
+                }
+                app.agent.todos.clear();
+                app.session.messages.clear();
+                let _ = ev_tx.send(WorkerEvent::Info("conversation cleared".into()));
+            }
+            WorkerCmd::ListModels => {
+                let _ = ev_tx.send(WorkerEvent::Busy(true));
+                match rt.block_on(app.agent.client.list_models()) {
+                    Ok(models) => {
+                        let current = app.agent.model.clone();
+                        let items = with_manual_model_entry(models)
+                            .into_iter()
+                            .map(|m| {
+                                let r = crate::tui::PickerRow::new(&m, "");
+                                if m == current {
+                                    r.badge("active")
+                                } else {
+                                    r
+                                }
+                            })
+                            .collect();
+                        let _ = ev_tx.send(WorkerEvent::Pick {
+                            title: "model".into(),
+                            items,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(WorkerEvent::Error(format!("listing models: {e:#}")));
+                    }
+                }
+                let _ = ev_tx.send(WorkerEvent::Busy(false));
+            }
+            WorkerCmd::SetModel(model) => {
+                app.agent.model = model.clone();
+                // Remember the pick on the stored provider, which is the source
+                // of truth for the next launch. The provider switch was
+                // already persisted, so not persisting the model left the two
+                // halves of "what I was using" disagreeing across restarts.
+                // Mirrors SetReasoning below, deliberately.
+                let name = app.active.name.clone();
+                let remembered = match app.config.providers.get_mut(&name) {
+                    Some(p) => {
+                        p.model = model.clone();
+                        app.config.save().is_ok()
+                    }
+                    // A built-in provider has no config entry to write to, and
+                    // inventing one here would strand a key that is only in the
+                    // environment. Say so instead of silently losing the pick.
+                    None => false,
+                };
+                let _ = ev_tx.send(WorkerEvent::ProviderSwitched {
+                    provider: name,
+                    model: model.clone(),
+                });
+                if !remembered {
+                    let _ = ev_tx.send(WorkerEvent::Info(format!(
+                        "model set for this session only — provider '{}' is not saved, \
+so it will not be remembered",
+                        app.active.name
+                    )));
+                }
+            }
+            WorkerCmd::SetReasoning(effort) => {
+                // Persist on the stored provider (source of truth), mirror on
+                // the live ActiveProvider and hot-swap the client so the very
+                // next request uses the new hint.
+                let name = app.active.name.clone();
+                if let Some(p) = app.config.providers.get_mut(&name) {
+                    p.reasoning_effort = effort.clone();
+                }
+                app.active.reasoning_effort = effort.clone();
+                if let Ok(client) = rebuild_client(&app.active) {
+                    app.agent.client = client;
+                }
+                let res = app.config.save();
+                let shown = effort.unwrap_or_else(|| "model default".into());
+                let msg = match res {
+                    Ok(()) => format!("reasoning effort set to {shown}"),
+                    Err(e) => format!("reasoning set to {shown} (save failed: {e:#})"),
+                };
+                let _ = ev_tx.send(WorkerEvent::Info(msg));
+            }
+            WorkerCmd::SetApprovalMode(mode) => {
+                app.agent.mode = mode;
+            }
+            WorkerCmd::UseProvider(name) => {
+                match switch_to(&mut app.config, &mut app.agent, &name, &app.cwd) {
+                    Ok(active) => {
+                        // Keep App state in sync so /status and the dashboard
+                        // reflect the switch immediately.
+                        app.active = active;
+                        let _ = ev_tx.send(WorkerEvent::ProviderSwitched {
+                            provider: name.clone(),
+                            model: app.agent.model.clone(),
+                        });
+                        let _ = ev_tx.send(WorkerEvent::Info(format!(
+                            "switched to '{name}' — model {}",
+                            app.agent.model
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                    }
+                }
+            }
+            WorkerCmd::ListProviders => {
+                let mut lines = String::new();
+                for (n, p) in &app.config.providers {
+                    let star = if Some(n.as_str()) == app.config.active_provider.as_deref() {
+                        "*"
+                    } else {
+                        " "
+                    };
+                    lines.push_str(&format!("{star} {n} — {} ({})\n", p.base_url, p.model));
+                }
+                if lines.is_empty() {
+                    lines = "no providers configured yet".into();
+                }
+                let _ = ev_tx.send(WorkerEvent::Info(lines));
+            }
+            WorkerCmd::ShowProvider => {
+                let a = &app.active;
+                let src = |f: &str| a.sources.get(f).map(String::as_str).unwrap_or("none");
+                let mut lines = format!(
+                    "provider : {}\nbase_url : {} (from: {})\nmodel    : {} (from: {})\napi_key  : set (from: {})\nconfig   : {}\n",
+                    a.name,
+                    a.base_url,
+                    src("base_url"),
+                    a.model,
+                    src("model"),
+                    src("api_key"),
+                    Config::toml_path().display(),
+                );
+                if !a.api_key.is_empty() && placeholder_key(&a.api_key) {
+                    lines.push_str("warning  : key looks like a placeholder — fix the config file or unset OPENAI_API_KEY\n");
+                }
+                if !a.headers.is_empty() {
+                    let names: Vec<&str> = a.headers.keys().map(|k| k.as_str()).collect();
+                    lines.push_str(&format!("headers  : {}\n", names.join(", ")));
+                }
+                lines.push_str("precedence: command line > environment > config file");
+                let _ = ev_tx.send(WorkerEvent::Info(lines));
+            }
+            WorkerCmd::Export => match export_transcript(&app) {
+                Ok(path) => {
+                    let _ = ev_tx.send(WorkerEvent::Info(format!(
+                        "transcript saved to {}",
+                        path.display()
+                    )));
+                }
+                Err(e) => {
+                    let _ = ev_tx.send(WorkerEvent::Error(format!("export failed: {e:#}")));
+                }
+            },
+            WorkerCmd::InitAgentsMd => {
+                if app.cwd.join("AGENTS.md").exists() {
+                    let _ = ev_tx.send(WorkerEvent::Info(
+                        "AGENTS.md already exists — edit it directly or ask the agent to update it"
+                            .into(),
+                    ));
+                } else {
+                    // Smart /init: have the agent analyze the project and
+                    // write a real brief instead of dumping a stub.
+                    let _ = ev_tx.send(WorkerEvent::Busy(true));
+                    const INIT_PROMPT: &str = "\
+Create an AGENTS.md file for THIS project in this directory. First explore: read Cargo.toml/package.json/Makefile/etc., list directories, skim key sources. Then write AGENTS.md containing: project overview (2-3 lines), build & test commands, code layout, and conventions you can infer. Keep it under 40 lines.";
+                    cancel.store(false, Ordering::Relaxed);
+                    let mut bridge = WorkerBridge {
+                        tx: ev_tx.clone(),
+                        approve_rx: approve_rx.clone(),
+                        cancel: cancel.clone(),
+                    };
+                    match rt.block_on(app.agent.run_turn(
+                        INIT_PROMPT,
+                        &[],
+                        &mut bridge,
+                        Some(&cancel),
+                    )) {
+                        Ok(()) => {
+                            app.persist();
+                            let msg = if app.cwd.join("AGENTS.md").exists() {
+                                "created AGENTS.md — review it and adjust to taste".to_string()
+                            } else {
+                                "agent finished but did not write AGENTS.md — try again".to_string()
+                            };
+                            let _ = ev_tx.send(WorkerEvent::Info(msg));
+                        }
+                        Err(e) => {
+                            // Offline / broken provider → fall back to stub.
+                            let fallback = init_agents_md_stub(&app.cwd)
+                                .unwrap_or_else(|fe| format!("{e:#}; stub also failed: {fe:#}"));
+                            let _ = ev_tx.send(WorkerEvent::Info(fallback));
+                        }
+                    }
+                    let _ = ev_tx.send(WorkerEvent::Busy(false));
+                }
+            }
+            WorkerCmd::ListSkills => {
+                // Same searchable picker the /session list uses.
+                let items = crate::skills::picker_items(&app.cwd);
+                if items.is_empty() {
+                    let dirs = crate::skills::skill_dirs(&app.cwd);
+                    let _ = ev_tx.send(WorkerEvent::Info(format!(
+                        "no skills found — create <name>/SKILL.md in:\n  {} (project)\n  {} (global)",
+                        dirs[1].display(),
+                        dirs[0].display()
+                    )));
+                } else {
+                    let _ = ev_tx.send(WorkerEvent::Pick {
+                        title: "skills".into(),
+                        items: rows(items),
+                    });
+                }
+            }
+            WorkerCmd::Lsp => {
+                if let Some(e) = app.agent.lsp_error.clone() {
+                    let _ = ev_tx.send(WorkerEvent::Error(format!("[lsp_servers] ignored: {e}")));
+                } else if app.agent.lsp.is_empty() {
+                    let _ = ev_tx.send(WorkerEvent::Info(
+                        "No language servers configured. Add one under \
+                         [lsp_servers.<name>] in config.toml, e.g. rust-analyzer \
+                         or clangd from Termux."
+                            .to_string(),
+                    ));
+                } else {
+                    let mut txt = String::new();
+                    for s in &app.agent.lsp.servers {
+                        let state = match s.last_error() {
+                            Some(e) => format!("failed — {e}"),
+                            None if s.is_running() => "running".to_string(),
+                            None => "not started".to_string(),
+                        };
+                        let exts: Vec<&str> = s.spec.filetypes.keys().map(String::as_str).collect();
+                        txt.push_str(&format!(
+                            "  {:<10} {state}\n             handles: {}\n",
+                            s.name,
+                            exts.join(", ")
+                        ));
+                    }
+                    let _ = ev_tx.send(WorkerEvent::Info(txt));
+                }
+            }
+            WorkerCmd::Mcp => {
+                if app.agent.mcp.is_empty() {
+                    let _ = ev_tx.send(WorkerEvent::Info(
+                        "No MCP servers configured. Add one under \
+                         [mcp_servers.<name>] in config.toml."
+                            .to_string(),
+                    ));
+                } else {
+                    let mut txt = String::new();
+                    for s in &app.agent.mcp.servers {
+                        let state = match &s.last_error {
+                            Some(e) => format!("failed — {e}"),
+                            None => format!("{} tool(s)", s.tools.len()),
+                        };
+                        let plan = if s.spec.plan { " · plan" } else { "" };
+                        txt.push_str(&format!("  {:<16} {state}{plan}\n", s.name));
+                        for t in &s.tools {
+                            txt.push_str(&format!("      {}\n", t.qualified));
+                        }
+                    }
+                    let _ = ev_tx.send(WorkerEvent::Info(txt));
+                }
+            }
+            WorkerCmd::Status => {
+                let a = &app.agent;
+                let mode = match a.mode {
+                    ApprovalMode::Suggest => "PLAN (read-only)",
+                    ApprovalMode::AutoEdit => "BUILD (edits auto-approved)",
+                    ApprovalMode::FullAuto => "FULL AUTO",
+                };
+                let src = |f: &str| {
+                    app.active
+                        .sources
+                        .get(f)
+                        .map(String::as_str)
+                        .unwrap_or("none")
+                };
+                let usage = match a.last_usage {
+                    Some(u) => format!(
+                        "ctx {} tok · out {} tok",
+                        // billable_prompt, not raw prompt_tokens: Anthropic
+                        // reports cached tokens outside prompt_tokens but they
+                        // still occupy the context window.
+                        u.billable_prompt(),
+                        u.completion_tokens
+                    ),
+                    None => "no requests yet".to_string(),
+                };
+                let (tp, tc) = a.tot_usage;
+                let est = a.session_cost();
+                let total = if tp + tc == 0 {
+                    "no tokens yet".to_string()
+                } else {
+                    format!("~{:.3}k tok · est ${:.4}", (tp + tc) as f64 / 1000.0, est)
+                };
+                // Guardrails + observability, so the user can see the ceilings
+                // and whether the structured log is actually running.
+                let budget = if a.limits.max_tokens.is_none() && a.limits.max_cost_usd.is_none() {
+                    "no limits set".to_string()
+                } else {
+                    let cap_t = a
+                        .limits
+                        .max_tokens
+                        .map(|m| format!(" / {m} tok"))
+                        .unwrap_or_default();
+                    let cap_c = a
+                        .limits
+                        .max_cost_usd
+                        .map(|m| format!(" / ${m}"))
+                        .unwrap_or_default();
+                    format!("{tp}+{tc} tok{cap_t}{cap_c}")
+                };
+                // How many times a transient failure is retried before the
+                // turn is failed for good.
+                let retries = format!(
+                    "{} ({} attempts)",
+                    a.client.max_retries(),
+                    a.client.max_retries() + 1
+                );
+                let hooks = if app.config.hooks.post_edit.is_empty() {
+                    "none".to_string()
+                } else {
+                    app.config.hooks.post_edit.join(" · ")
+                };
+                let logging = if a.logger.is_active() {
+                    app.config
+                        .logging
+                        .file
+                        .clone()
+                        .unwrap_or_else(|| "stderr".into())
+                } else {
+                    "off".into()
+                };
+                // Transport tweaks matter when debugging TLS/proxy trouble,
+                // so make the active ones (and only those) visible.
+                let net = &app.config.network;
+                let mut transport: Vec<String> = Vec::new();
+                if let Some(p) = net
+                    .proxy
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    transport.push(format!("proxy {p}"));
+                }
+                if let Some(ca) = net
+                    .ca_bundle
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    transport.push(format!("ca {ca}"));
+                }
+                if net.insecure == Some(true) {
+                    transport.push("insecure TLS".to_string());
+                }
+                let network = if transport.is_empty() {
+                    "default".to_string()
+                } else {
+                    transport.join(" · ")
+                };
+                let lines = format!(
+                    "provider : {} ({})\nmodel    : {} [key from: {}]\nmode     : {}\nreasoning: {}\nsession  : {} · {} messages · {} checkpoint(s)\nusage    : {}\ntotal    : {}\nbudget   : {}\nretries  : {}\ncontext  : {} tok window (compact at {})\npost-edit: {}\nlogging  : {}\nnetwork  : {}\ncwd      : {}\nconfig   : {}",
+                    app.active.name,
+                    app.active.base_url,
+                    a.model,
+                    src("api_key"),
+                    mode,
+                    app.active.reasoning_effort.as_deref().unwrap_or("model default"),
+                    app.session.id,
+                    a.messages.len(),
+                    app.session.checkpoints.len(),
+                    usage,
+                    total,
+                    budget,
+                    retries,
+                    a.ctx_window,
+                    budget::compact_threshold(a.ctx_window),
+                    hooks,
+                    logging,
+                    network,
+                    app.cwd.display(),
+                    Config::toml_path().display(),
+                );
+                let _ = ev_tx.send(WorkerEvent::Info(lines));
+            }
+            WorkerCmd::Diff => {
+                let _ = ev_tx.send(WorkerEvent::Busy(true));
+                let out = rt.block_on(tools::run_shell(
+                    "git --no-pager diff --stat HEAD 2>&1 | tail -15; \
+                     echo; git --no-pager diff -U1 HEAD 2>&1 | head -c 2500",
+                    &app.cwd,
+                ));
+                match out {
+                    Ok(o) if o.contains("[exit: 0]") && o.lines().count() > 1 => {
+                        let body = o.split_once('\n').map(|(_, r)| r).unwrap_or(&o);
+                        let _ = ev_tx
+                            .send(WorkerEvent::Info(format!("git diff:\n{}", body.trim_end())));
+                    }
+                    Ok(_) => {
+                        let _ = ev_tx.send(WorkerEvent::Info("no uncommitted changes".into()));
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                    }
+                }
+                let _ = ev_tx.send(WorkerEvent::Busy(false));
+            }
+            WorkerCmd::Review => {
+                let _ = ev_tx.send(WorkerEvent::Busy(true));
+                let out = rt.block_on(tools::run_shell(
+                    "git --no-pager diff --stat HEAD 2>&1 | tail -20; \
+                     echo; git --no-pager diff -U3 HEAD 2>&1 | head -c 12000",
+                    &app.cwd,
+                ));
+                let diff = match &out {
+                    Ok(o) if o.contains("[exit: 0]") => o
+                        .split_once('\n')
+                        .map(|(_, r)| r)
+                        .unwrap_or(o)
+                        .trim_end_matches("[commit: "),
+                    _ => "",
+                };
+                if diff.is_empty() {
+                    let _ =
+                        ev_tx.send(WorkerEvent::Info("no uncommitted changes to review".into()));
+                    let _ = ev_tx.send(WorkerEvent::Busy(false));
+                } else {
+                    let task = format!(
+                        "Review these uncommitted changes and report issues as \
+                         CRITICAL / WARNING / NIT lines with file:line references. \
+                         If the changes look clean, say so explicitly.\n\n{diff}"
+                    );
+                    let sink: Box<dyn crate::agent::UiSink> = Box::new(SubBridge {
+                        inner: WorkerBridge {
+                            tx: ev_tx.clone(),
+                            approve_rx: approve_rx.clone(),
+                            cancel: cancel.clone(),
+                        },
+                        prefix: "[review] ".to_string(),
+                    });
+                    let client = app.agent.client.clone();
+                    let model = app.agent.model.clone();
+                    let cwd = app.agent.cwd.clone();
+                    let mode = app.agent.mode;
+                    let res = rt.block_on(crate::agents::run_sub_agent(
+                        &client, &model, &cwd, mode, "reviewer", &task, sink,
+                    ));
+                    // `/review` is a delegation too — charge it, or a free
+                    // full-repo review bypasses `max_cost_usd` entirely.
+                    app.agent.add_usage(res.usage.0, res.usage.1);
+                    let _ = ev_tx.send(WorkerEvent::Info(format!(
+                        "review complete:\n{}",
+                        res.report
+                    )));
+                    let _ = ev_tx.send(WorkerEvent::Busy(false));
+                }
+            }
+            WorkerCmd::Undo(n) => match app.agent.undo_turns(n) {
+                Ok(msg) => {
+                    let _ = ev_tx.send(WorkerEvent::Info(msg));
+                }
+                Err(e) => {
+                    let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                }
+            },
+            WorkerCmd::ListSessions => {
+                let recent = Session::list_recent(12);
+                if recent.is_empty() {
+                    let _ = ev_tx.send(WorkerEvent::Info("no saved sessions yet".into()));
+                } else {
+                    let current = app.session.id.clone();
+                    let items = recent
+                        .into_iter()
+                        .map(|(id, name, created, preview)| {
+                            // The name is what a human recognises; the id and
+                            // date are context. Resuming the session you are
+                            // already in is a no-op worth marking.
+                            let label = name.unwrap_or_else(|| "(unnamed)".to_string());
+                            let r = crate::tui::PickerRow::new(
+                                label,
+                                format!("{id} · {} · {preview}", fmt_unix_date(created)),
+                            );
+                            if id == current {
+                                r.badge("current")
+                            } else {
+                                r
+                            }
+                        })
+                        .collect();
+                    let _ = ev_tx.send(WorkerEvent::Pick {
+                        title: "resume".into(),
+                        items,
+                    });
+                }
+            }
+            WorkerCmd::ListSessionsByKeyword(kw) => {
+                let hits = Session::find_by_keyword(&kw, 20);
+                if hits.is_empty() {
+                    let _ = ev_tx.send(WorkerEvent::Info(format!("no sessions match '{kw}'")));
+                } else {
+                    let items: Vec<crate::tui::PickerRow> = hits
+                        .into_iter()
+                        .map(|(s, preview)| {
+                            crate::tui::PickerRow::new(
+                                s.name.unwrap_or_else(|| "(unnamed)".into()),
+                                format!("{} · {} · {preview}", s.id, fmt_unix_date(s.created_unix)),
+                            )
+                        })
+                        .collect();
+                    let _ = ev_tx.send(WorkerEvent::Pick {
+                        title: "resume".into(),
+                        items,
+                    });
+                }
+            }
+            WorkerCmd::DeleteSession(id) => {
+                let real = session_id_from_row(&id);
+                match Session::delete(&real) {
+                    Ok(Some(removed)) => {
+                        let _ = ev_tx.send(WorkerEvent::SessionDeleted(removed));
+                    }
+                    Ok(None) => {
+                        let _ = ev_tx
+                            .send(WorkerEvent::Error(format!("no session '{real}' to delete")));
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                    }
+                }
+            }
+            WorkerCmd::RenameSession(name) => match app.session.set_name(name) {
+                Ok(()) => {
+                    let _ = ev_tx.send(WorkerEvent::SessionName(
+                        app.session.name.clone().unwrap_or_default(),
+                    ));
+                    let _ = ev_tx.send(WorkerEvent::Info(if let Some(n) = &app.session.name {
+                        format!("session named '{n}'")
+                    } else {
+                        "session name cleared".into()
+                    }));
+                }
+                Err(e) => {
+                    let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                }
+            },
+            WorkerCmd::ResumeSession(id) => {
+                // Picker items are "id · name · date · preview" — id is first.
+                let real_id = session_id_from_row(&id);
+                match resume_session(&mut app, &real_id) {
+                    Ok((msg, entries)) => {
+                        let _ = ev_tx.send(WorkerEvent::Reload {
+                            text: msg,
+                            entries,
+                            session_id: app.session.id.clone(),
+                            session_name: app.session.name.clone(),
+                        });
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                    }
+                }
+            }
+            WorkerCmd::Checkpoint(label) => {
+                // Snapshot the live agent conversation (not the persisted
+                // copy) so the checkpoint reflects what the user just saw.
+                app.session.messages = app.agent.messages.clone();
+                match app.session.create_checkpoint(label) {
+                    Ok(cp) => {
+                        let _ = ev_tx.send(WorkerEvent::Info(format!(
+                            "checkpoint #{} saved ({}) · branch later with /branch {}\nbranch id: {}",
+                            app.session.checkpoints.len(),
+                            cp.id,
+                            app.session.checkpoints.len(),
+                            cp.id
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                    }
+                }
+            }
+            WorkerCmd::ListCheckpoints => {
+                app.session.messages = app.agent.messages.clone();
+                let items = app.session.checkpoint_items();
+                if items.is_empty() {
+                    let _ = ev_tx.send(WorkerEvent::Info(app.session.checkpoint_list()));
+                } else {
+                    let _ = ev_tx.send(WorkerEvent::Pick {
+                        title: "checkpoints".into(),
+                        items: rows(items),
+                    });
+                }
+            }
+            WorkerCmd::BranchCheckpoint(cp_ref) => {
+                app.session.messages = app.agent.messages.clone();
+                match app.session.branch_from(&cp_ref) {
+                    Ok(branched) => {
+                        // Switch the live conversation to the branch.
+                        match resume_session(&mut app, &branched.id) {
+                            Ok((msg, entries)) => {
+                                let _ = ev_tx.send(WorkerEvent::Reload {
+                                    text: msg,
+                                    entries,
+                                    session_id: app.session.id.clone(),
+                                    session_name: app.session.name.clone(),
+                                });
+                            }
+                            Err(e) => {
+                                let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                    }
+                }
+            }
+            WorkerCmd::QueueImage(path) => match load_image_data_uri(&app.cwd, &path) {
+                Ok(uri) => {
+                    pending_images.push(uri);
+                    let _ = ev_tx.send(WorkerEvent::Info(format!(
+                        "image attached ({} queued) — it will ride along with your next message",
+                        pending_images.len()
+                    )));
+                }
+                Err(e) => {
+                    let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                }
+            },
+            WorkerCmd::SetupListModels { base_url, api_key } => {
+                // Authenticated catalog peek — this doubles as proof that
+                // the freshly typed key actually works before we save it.
+                let probe =
+                    ChatClient::new(&base_url, &api_key, &Default::default(), None, "openai");
+                match probe.and_then(|c| rt.block_on(c.list_models())) {
+                    Ok(models) => {
+                        let _ = ev_tx.send(WorkerEvent::Pick {
+                            title: "models".into(),
+                            items: rows(with_manual_model_entry(models)),
+                        });
+                    }
+                    Err(_) => {
+                        let _ = ev_tx.send(WorkerEvent::SetupModelsFailed);
+                    }
+                }
+            }
+            WorkerCmd::FinishProviderSetup {
+                name,
+                base_url,
+                model,
+                api_key,
+            } => match finish_provider_setup(&mut app, &rt, &name, &base_url, &model, &api_key) {
+                Ok(note) => {
+                    let _ = ev_tx.send(WorkerEvent::ProviderSwitched {
+                        provider: app.active.name.clone(),
+                        model: app.agent.model.clone(),
+                    });
+                    let _ = ev_tx.send(WorkerEvent::Info(note));
+                }
+                Err(e) => {
+                    let _ = ev_tx.send(WorkerEvent::Error(format!("provider setup failed: {e:#}")));
+                }
+            },
+            WorkerCmd::SetTheme(name) => {
+                app.config.theme = Some(name.clone());
+                let res = app.config.save();
+                let msg = match res {
+                    Ok(()) => format!("theme saved: {name}"),
+                    Err(e) => format!("{e:#}"),
+                };
+                let _ = ev_tx.send(WorkerEvent::Info(msg));
+            }
+            WorkerCmd::SetEffect(name) => {
+                app.config.effect = Some(name.clone());
+                let res = app.config.save();
+                let msg = match res {
+                    Ok(()) => format!("effect saved: {name}"),
+                    Err(e) => format!("{e:#}"),
+                };
+                let _ = ev_tx.send(WorkerEvent::Info(msg));
+            }
+            WorkerCmd::PickProvider(purpose) => {
+                if app.config.providers.is_empty() {
+                    let _ = ev_tx.send(WorkerEvent::Info(
+                        "no providers configured yet — run /provider → add first".into(),
+                    ));
+                } else {
+                    let title = match purpose {
+                        ProviderMenu::Use => "provider_use",
+                        ProviderMenu::Edit => "provider_edit",
+                    };
+                    let active = app.config.active_provider.clone().unwrap_or_default();
+                    let items = app
+                        .config
+                        .providers
+                        .iter()
+                        .map(|(n, p)| {
+                            // Base url is the part that tells you *where* a
+                            // provider points; the model alone does not.
+                            let detail = match (p.model.is_empty(), p.base_url.is_empty()) {
+                                (false, false) => format!("{} · {}", p.model, p.base_url),
+                                (false, true) => p.model.clone(),
+                                (true, false) => p.base_url.clone(),
+                                (true, true) => "(not configured)".into(),
+                            };
+                            let r = crate::tui::PickerRow::new(n, detail);
+                            let r = if *n == active.as_str() {
+                                r.badge("active")
+                            } else {
+                                r
+                            };
+                            r
+                        })
+                        .collect();
+                    let _ = ev_tx.send(WorkerEvent::Pick {
+                        title: title.into(),
+                        items,
+                    });
+                }
+            }
+            WorkerCmd::EditProviderPickModel(name) => {
+                let Some(p) = app.config.providers.get(&name).cloned() else {
+                    let _ = ev_tx.send(WorkerEvent::Error(format!("provider '{name}' not found")));
+                    continue;
+                };
+                let client = ChatClient::new(&p.base_url, &p.api_key, &p.headers, None, &p.kind);
+                match client.and_then(|c| rt.block_on(c.list_models())) {
+                    Ok(models) => {
+                        let mut items = with_manual_model_entry(models);
+                        items.insert(0, "(keep current model)".into());
+                        let _ = ev_tx.send(WorkerEvent::Pick {
+                            title: "edit model".into(),
+                            items: rows(items),
+                        });
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(WorkerEvent::Error(format!(
+                            "couldn't list models for '{name}': {e:#} — is the stored key valid?"
+                        )));
+                    }
+                }
+            }
+            WorkerCmd::EditProviderSetModel { provider, model } => {
+                match edit_provider_model(&mut app, &provider, &model) {
+                    Ok(msg) => {
+                        let _ = ev_tx.send(WorkerEvent::ProviderSwitched {
+                            provider: app.active.name.clone(),
+                            model: app.agent.model.clone(),
+                        });
+                        let _ = ev_tx.send(WorkerEvent::Info(msg));
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                    }
+                }
+            }
+            WorkerCmd::FinishEditApiKey { provider, api_key } => {
+                match finish_edit_api_key(&mut app, &rt, &provider, &api_key) {
+                    Ok(note) => {
+                        let _ = ev_tx.send(WorkerEvent::ProviderSwitched {
+                            provider: app.active.name.clone(),
+                            model: app.agent.model.clone(),
+                        });
+                        let _ = ev_tx.send(WorkerEvent::Info(note));
+                    }
+                    Err(e) => {
+                        let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+                    }
+                }
+            }
+        }
+    }
+    // The command channel is closed, so the TUI is gone. Close the language
+    // servers properly: `shutdown` + `exit` lets them flush their index,
+    // whereas `kill_on_drop` alone throws that away and the next session pays
+    // to rebuild it.
+    rt.block_on(app.agent.lsp.shutdown_all());
+    app.persist();
+}
+
+fn run_agent_turn(
+    app: &mut App,
+    rt: &tokio::runtime::Runtime,
+    ev_tx: &Sender<WorkerEvent>,
+    approve_rx: &Arc<std::sync::Mutex<Receiver<bool>>>,
+    cancel: &Arc<AtomicBool>,
+    text: &str,
+    images: &[String],
+) {
+    cancel.store(false, Ordering::Relaxed);
+    let _ = ev_tx.send(WorkerEvent::Busy(true));
+    let mut bridge = WorkerBridge {
+        tx: ev_tx.clone(),
+        approve_rx: approve_rx.clone(),
+        cancel: cancel.clone(),
+    };
+    let res = rt.block_on(app.agent.run_turn(text, images, &mut bridge, Some(cancel)));
+    if let Err(e) = res {
+        let msg = format!("{e:#}");
+        let _ = ev_tx.send(if msg.contains("interrupted") {
+            WorkerEvent::Info("interrupted".into())
+        } else {
+            WorkerEvent::Error(msg)
+        });
+    }
+    app.persist();
+    let _ = ev_tx.send(WorkerEvent::SessionName(
+        app.session.name.clone().unwrap_or_default(),
+    ));
+    let _ = ev_tx.send(WorkerEvent::Busy(false));
+}
+
+/// Append a `# memory` bullet to AGENTS.md in the project root.
+fn add_memory(cwd: &std::path::Path, note: &str) -> Result<String> {
+    let note = note.trim();
+    if note.is_empty() {
+        bail!("empty memory — usage: #<fact to remember about this project>");
+    }
+    let path = cwd.join("AGENTS.md");
+    let mut body = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => "# AGENTS.md — instructions for AI coding agents\n".to_string(),
+    };
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str(&format!("- {note}\n"));
+    std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
+    Ok(format!("remembered: {note}"))
+}
+
+/// Load + base64-encode an image file into a data URI (vision input).
+pub fn load_image_data_uri(_cwd: &PathBuf, path: &str) -> Result<String> {
+    const ALLOWED: &[(&str, &str)] = &[
+        ("png", "image/png"),
+        ("jpg", "image/jpeg"),
+        ("jpeg", "image/jpeg"),
+        ("webp", "image/webp"),
+        ("gif", "image/gif"),
+    ];
+    let p = PathBuf::from(path);
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+    let mime = ALLOWED
+        .iter()
+        .find(|(e, _)| *e == ext)
+        .map(|(_, m)| *m)
+        .with_context(|| format!("unsupported image type '.{ext}' — use png/jpg/jpeg/webp/gif"))?;
+    let bytes = std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        bail!("image too large ({} bytes, limit 8 MiB)", bytes.len());
+    }
+    Ok(format!(
+        "data:{mime};base64,{}",
+        crate::api::base64_encode(&bytes)
+    ))
+}
+
+/// Replace the live conversation with a stored session. Returns a status
+/// line plus the replayed transcript for the TUI.
+/// Pull a session id out of a picker row. Rows lead with the session *name*
+/// so the list is readable, which means the id can sit anywhere in the row —
+/// so find it by shape (`<unix-seconds>-<hex>`) rather than by position. The
+/// lower bound rejects dates like `2025-09-27`, whose first field would
+/// otherwise look enough like a timestamp.
+fn session_id_from_row(row: &str) -> String {
+    let found = row
+        .split(" · ")
+        .flat_map(|f| f.split_whitespace())
+        .find(|tok| {
+            let Some((secs, rand)) = tok.split_once('-') else {
+                return false;
+            };
+            secs.parse::<u64>().is_ok_and(|n| n >= 1_000_000_000)
+                && !rand.is_empty()
+                && rand.chars().all(|c| c.is_ascii_hexdigit())
+        });
+    match found {
+        Some(id) => id.to_string(),
+        // No recognisable id: keep the old first-field behaviour so a
+        // hand-typed or already-valid id still works.
+        None => row.split(" · ").next().unwrap_or(row).to_string(),
+    }
+}
+
+fn resume_session(app: &mut App, id: &str) -> Result<(String, Vec<Entry>)> {
+    let sess = Session::load(id)?;
+    let kept: Vec<Message> = sess
+        .restore()
+        .into_iter()
+        .filter(|m| m.role != "system")
+        .collect();
+    anyhow::ensure!(
+        !kept.is_empty(),
+        "session '{id}' has no messages to restore"
+    );
+    app.agent.messages.truncate(1); // keep the fresh system prompt
+    app.agent.messages.extend(kept);
+    app.agent.messages.push(Message::user(
+        "[Resuming previous session above. Continue where it left off.]".to_string(),
+    ));
+    app.agent.todos.clear();
+    app.session = sess;
+    app.persist();
+    // Replay what happened so the user sees their earlier work on screen.
+    let entries = transcript_entries(&app.agent.messages);
+    Ok((
+        format!(
+            "resumed session {id} — replayed {} items above",
+            entries.len()
+        ),
+        entries,
+    ))
+}
+
+/// `1760000000` → `2025-10-09` without pulling chrono.
+fn fmt_unix_date(secs: u64) -> String {
+    let days = secs / 86_400;
+    let z = days as i64 + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y}-{m:02}-{d:02}")
+}
+
+fn run_passthrough_shell(
+    app: &App,
+    rt: &tokio::runtime::Runtime,
+    ev_tx: &Sender<WorkerEvent>,
+    shell_cmd: &str,
+) {
+    let trimmed = shell_cmd.trim();
+    if trimmed.is_empty() {
+        let _ = ev_tx.send(WorkerEvent::Error("usage: !<command>".into()));
+        return;
+    }
+    let _ = ev_tx.send(WorkerEvent::Busy(true));
+    match rt.block_on(tools::run_shell(trimmed, &app.cwd)) {
+        Ok(out) => {
+            let _ = ev_tx.send(WorkerEvent::Info(out.trim_end().to_string()));
+        }
+        Err(e) => {
+            let _ = ev_tx.send(WorkerEvent::Error(format!("{e:#}")));
+        }
+    }
+    let _ = ev_tx.send(WorkerEvent::Busy(false));
+}
+
+fn export_transcript(app: &App) -> Result<PathBuf> {
+    let mut out = String::from("# Laudacode session\n\n");
+    for msg in &app.agent.messages {
+        let role = match msg.role.as_str() {
+            "system" => continue,
+            r => r,
+        };
+        let body = msg.content.clone().unwrap_or_default();
+        if body.is_empty() && !msg.tool_calls.is_empty() {
+            out.push_str("## assistant (tool calls)\n");
+            for tc in &msg.tool_calls {
+                out.push_str(&format!(
+                    "- `{}` {}\n",
+                    tc.function.name, tc.function.arguments
+                ));
+            }
+            out.push('\n');
+        } else {
+            out.push_str(&format!("## {role}\n\n{body}\n\n"));
+        }
+    }
+    let dir = app.cwd.join(".laudacode");
+    std::fs::create_dir_all(&dir).context("creating .laudacode export dir")?;
+    let path = dir.join(format!("session-{}.md", app.session.id));
+    std::fs::write(&path, out).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
+fn init_agents_md_stub(cwd: &std::path::Path) -> Result<String> {
+    let path = cwd.join("AGENTS.md");
+    if path.exists() {
+        return Ok("AGENTS.md already exists here".into());
+    }
+    let stub = "# AGENTS.md — instructions for AI coding agents\n\n\
+        - Describe build/test commands here.\n\
+        - Describe code conventions the agent must follow.\n\
+        - Keep it short; it is loaded into the system prompt.\n";
+    std::fs::write(&path, stub).with_context(|| format!("writing {}", path.display()))?;
+    Ok("created a stub AGENTS.md (offline fallback) — edit it with project instructions".into())
+}
+
+// ---------------------------------------------------------------------------
+// Custom commands (.laudacode/commands/*.md + global dir)
+// ---------------------------------------------------------------------------
+
+/// A user-defined slash command (parity with modern agent CLIs).
+#[derive(Debug, Clone)]
+pub struct CustomCmd {
+    pub name: String,
+    pub description: String,
+    pub template: String,
+}
+
+/// Scan the project `.laudacode/commands/` and the global
+/// `config_dir/laudacode/commands/`. Project entries override global ones.
+pub fn load_custom_commands(cwd: &std::path::Path) -> Vec<CustomCmd> {
+    let mut out: Vec<CustomCmd> = Vec::new();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(g) = dirs::config_dir() {
+        dirs.push(g.join("laudacode").join("commands"));
+    }
+    dirs.push(cwd.join(".laudacode").join("commands"));
+    for dir in dirs {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut files: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+        files.sort_by_key(|e| e.file_name());
+        for f in files {
+            let name = f.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".md") {
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(f.path()) else {
+                continue;
+            };
+            let (description, template) = split_frontmatter(&raw);
+            let cmd_name = name.trim_end_matches(".md").to_string();
+            out.retain(|c: &CustomCmd| c.name != cmd_name); // later dir wins
+            out.push(CustomCmd {
+                name: cmd_name,
+                description,
+                template,
+            });
+        }
+    }
+    out
+}
+
+/// Split optional `--- description: … ---` frontmatter from the body.
+fn split_frontmatter(raw: &str) -> (String, String) {
+    let trimmed = raw.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("---") {
+        if let Some(end) = rest.find("\n---") {
+            let head = &rest[..end];
+            let body = rest[end + 4..].trim_start_matches('\n').to_string();
+            let mut description = String::new();
+            for line in head.lines() {
+                if let Some(v) = line.trim().strip_prefix("description:") {
+                    description = v.trim().to_string();
+                }
+            }
+            return (description, body);
+        }
+    }
+    (String::new(), trimmed.to_string())
+}
+
+/// Render a command template:
+/// - `$ARGUMENTS` → all args; `$1..$9` → positional args
+/// - `` !`cmd` `` → shell output (runs in cwd)
+/// - `@path` → file contents inline
+pub fn render_command_template(tpl: &str, args: &str, cwd: &std::path::Path) -> String {
+    let argv: Vec<&str> = args.split_whitespace().collect();
+    let mut out = tpl.replace("$ARGUMENTS", args.trim());
+    for (i, v) in argv.iter().enumerate().take(9) {
+        out = out.replace(&format!("${}", i + 1), v);
+    }
+
+    // Shell injection: !`cmd`
+    while let Some(start) = out.find("!`") {
+        let Some(rel_end) = out[start + 2..].find('`') else {
+            break;
+        };
+        let cmd = &out[start + 2..start + 2 + rel_end];
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(cwd)
+            .output()
+            .ok()
+            .map(|o| {
+                let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+                s.push_str(&String::from_utf8_lossy(&o.stderr));
+                s.trim_end().to_string()
+            })
+            .unwrap_or_else(|| "(command failed)".into());
+        let capped: String = output.chars().take(4000).collect();
+        out.replace_range(start..start + 2 + rel_end + 1, &capped);
+    }
+
+    // File references: @relative/path (until whitespace)
+    expand_at_files(&out, cwd)
+}
+
+/// Inline `@relative/path` file references in a prompt (capped at 8 KiB each).
+/// Used by command templates AND ordinary user prompts, so `@src/main.rs`
+/// attaches the file's contents instead of sending the literal token.
+pub fn expand_at_files(text: &str, cwd: &std::path::Path) -> String {
+    let mut rendered = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('@') {
+        let boundary = at == 0
+            || !{
+                let prev = rest[..at].chars().last().unwrap_or(' ');
+                prev.is_alphanumeric()
+            };
+        let token: String = rest[at + 1..]
+            .chars()
+            .take_while(|c| !c.is_whitespace())
+            .collect();
+        if boundary && !token.is_empty() && token != "ARGUMENTS" {
+            if let Ok(content) = std::fs::read_to_string(cwd.join(&token)) {
+                let capped: String = content.chars().take(8 * 1024).collect();
+                rendered.push_str(&rest[..at]);
+                rendered.push_str(&format!(
+                    "\n--- {token} ---\n{capped}\n--- end {token} ---\n"
+                ));
+                rest = &rest[at + 1 + token.len()..];
+                continue;
+            }
+        }
+        rendered.push_str(&rest[..at + 1]);
+        rest = &rest[at + 1..];
+    }
+    rendered.push_str(rest);
+    rendered
+}
+
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
+
+pub struct App {
+    pub config: Config,
+    pub active: ActiveProvider,
+    pub agent: Agent,
+    pub session: Session,
+    pub ui: TermUi,
+    pub cwd: PathBuf,
+    /// Assumed context-window size (tokens) for the TUI meter.
+    pub ctx_window: u64,
+    /// Data-URI images queued for the first prompt (`-i` flag).
+    pub pending_images: Vec<String>,
+    /// Entries to replay into the TUI on start (set by session restores).
+    pub pending_transcript: Vec<Entry>,
+    /// Custom commands loaded at startup (kept for submission routing).
+    pending_custom_cmds: Vec<CustomCmd>,
+}
+
+/// Summary of a finished TUI session, used for the exit resume hint.
+pub struct SessionExit {
+    pub id: String,
+    pub messages: usize,
+}
+
+impl App {
+    // -----------------------------------------------------------------------
+    // Full-screen TUI mode
+    // -----------------------------------------------------------------------
+
+    /// Run the interactive full-screen TUI until the user quits.
+    ///
+    /// Sync on purpose: the TUI event loop owns the terminal, and all agent
+    /// work happens on the worker thread (`spawn_worker`). Returns the final
+    /// session identity so the shell can print an exact `--resume` hint.
+    pub fn run_tui(self) -> Result<SessionExit> {
+        tuiapp::enter_tui()?;
+        let res = self.tui_main();
+        tuiapp::leave_tui();
+        res
+    }
+
+    fn tui_main(mut self) -> Result<SessionExit> {
+        let initial_id = self.session.id.clone();
+        let project_cwd = self.cwd.clone();
+        let mut tui = Tui::new();
+        // Keep UI and agent in lock-step from frame one: without this the
+        // composer claimed BUILD while the agent still enforced read-only
+        // PLAN rules (the agent's default is Suggest, the widget's was Build).
+        tui.mode = tui_mode_of(self.agent.mode);
+        tui.set_usage(0, self.ctx_window);
+        // Replay any restored conversation (from --resume / --continue-last)
+        // so the transcript shows earlier work from the first frame.
+        for e in std::mem::take(&mut self.pending_transcript) {
+            tui.push(e);
+        }
+        tui.dash.set_session(
+            &self.session.id,
+            &self.active.model,
+            &self.active.name,
+            &home_shortened(&self.cwd),
+            self.agent
+                .messages
+                .iter()
+                .filter(|m| m.role != "system")
+                .count(),
+        );
+        // Seed the @-mention list from the project tree.
+        {
+            let mut files = Vec::new();
+            tools::walk_files(&self.cwd, &mut |p| {
+                if files.len() < 2000 {
+                    if let Ok(rel) = p.strip_prefix(&self.cwd) {
+                        files.push(rel.display().to_string());
+                    }
+                    return true;
+                }
+                false
+            });
+            tui.set_files(files);
+        }
+        // User-defined /commands from .laudacode/commands + global dir.
+        let custom_cmds = load_custom_commands(&self.cwd);
+        if !custom_cmds.is_empty() {
+            let listing = custom_cmds
+                .iter()
+                .map(|c| format!("  /{:<14} {}", c.name, c.description))
+                .collect::<Vec<_>>()
+                .join("\n");
+            tui.push(Entry::Info(format!(
+                "custom commands loaded:\n{listing}\n\nargs: $ARGUMENTS/$1 · @file inlines a file · !`cmd` injects output"
+            )));
+        }
+        tui.custom_templates = custom_cmds
+            .iter()
+            .map(|c| (c.name.clone(), c.template.clone()))
+            .collect();
+        tui.set_custom_cmds(
+            custom_cmds
+                .iter()
+                .map(|c| (c.name.clone(), c.description.clone()))
+                .collect(),
+        );
+        self.pending_custom_cmds = custom_cmds;
+        let config_note = if placeholder_key(&self.active.api_key) {
+            format!(
+                "\n⚠ API key looks like a placeholder — fix {} or unset OPENAI_API_KEY",
+                Config::toml_path().display()
+            )
+        } else if self.active.sources.get("api_key").map(String::as_str) == Some("environment") {
+            format!(
+                "\n· API key is coming from $OPENAI_API_KEY (overrides {})",
+                Config::toml_path().display()
+            )
+        } else {
+            String::new()
+        };
+        // No wizard on first run — the user connects from inside the TUI.
+        // Keyless built-in free providers (e.g. the stock aitopia default) need
+        // no setup — only keyed providers missing a key/model must be steered.
+        let needs_setup = !is_free_kind(&self.active.kind)
+            && (self.active.api_key.is_empty() || self.active.model.is_empty());
+        tui.needs_setup = needs_setup;
+        // ↑/↓ recall of prompts from previous sessions too.
+        tui.seed_history(load_prompt_history());
+        // Apply persisted look & feel before the first frame renders.
+        if let Some(t) = &self.config.theme {
+            crate::theme::set(t);
+        }
+        tui.fx = crate::effects::Engine::new(crate::effects::EffectKind::parse(
+            self.config.effect.as_deref(),
+        ));
+        let shown_model = if self.active.model.is_empty() {
+            "(not configured)".to_string()
+        } else {
+            self.active.model.clone()
+        };
+        tui.push(Entry::Info(format!(
+            "LaudaCode ready — model {shown_model} · mode {}\nTab cycles PLAN → BUILD → FULL AUTO · type / for commands (Tab completes) · Esc interrupts{}",
+            tui.mode.label(),
+            config_note
+        )));
+        if needs_setup {
+            let presets = PROVIDER_PRESETS
+                .iter()
+                .map(|p| p.name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            tui.push(Entry::Info(format!(
+                "no provider configured yet — run /provider add to connect\npresets: {presets}"
+            )));
+        }
+        let subtitle = format!("· {}", self.active.name);
+
+        let worker = spawn_worker(self);
+        // The UI closure takes ownership of the command/approve handles; the
+        // event stream is shared (Arc) so we can also catch the worker's
+        // final summary after the loop ends.
+        let events = Arc::new(std::sync::Mutex::new(worker.events));
+        let wait_events = Arc::clone(&events);
+        // Clone the channel handles for the closure — `worker` itself keeps
+        // nothing else we need here.
+        let ui_cmd = worker.cmd.clone();
+        let ui_approve = worker.approve.clone();
+        let ui_cancel = Arc::clone(&worker.cancel);
+
+        let keep_going = tuiapp::run_tui(&mut tui, subtitle, move |tui, action| {
+            // Drain everything the worker produced since the last tick.
+            while let Ok(ev) = events.lock().unwrap().try_recv() {
+                apply_worker_event(tui, ev);
+            }
+
+            match action {
+                KeyAction::Quit => {
+                    let _ = ui_approve.send(false); // unblock a pending approval
+                    let _ = ui_cmd.send(WorkerCmd::Quit);
+                    return false;
+                }
+                KeyAction::CycleMode => cycle_mode(tui, &ui_cmd),
+                KeyAction::ToggleBanner => {
+                    tui.toggle_banner();
+                    if tui.banner_visible() {
+                        tui.set_status(format!(
+                            "banner: {} logo — Ctrl+B to toggle",
+                            tui.banner_logo().name
+                        ));
+                    } else {
+                        tui.set_status("banner hidden — Ctrl+B to toggle");
+                    }
+                }
+                KeyAction::Approve(answer) => {
+                    let _ = ui_approve.send(answer);
+                }
+                KeyAction::ApproveAlways => {
+                    // "Always allow": approve now + flip to FULL AUTO.
+                    tui.mode = tuiapp::Mode::FullAuto;
+                    let _ = ui_cmd.send(WorkerCmd::SetApprovalMode(ApprovalMode::FullAuto));
+                    tui.push(Entry::Info(
+                        "approved — approval mode set to FULL AUTO for this session".into(),
+                    ));
+                    let _ = ui_approve.send(true);
+                }
+                KeyAction::Interrupt => {
+                    if tui.is_busy() {
+                        ui_cancel.store(true, Ordering::Relaxed);
+                        tui.set_status("interrupting…");
+                    }
+                }
+                KeyAction::OpenSlash(sel) => {
+                    // Picker selections arrive as "title:value".
+                    if let Some(model) = sel.strip_prefix("model:") {
+                        if model == MANUAL_MODEL_ITEM {
+                            // Hidden/new model not in the catalog — type it.
+                            tui.open_input_modal(tuiapp::InputModal::new(
+                                "Model id",
+                                "Type the exact model id (e.g. stealth/ox-alpha) and press Enter.",
+                                false,
+                            ));
+                            tui.set_status("enter model id");
+                        } else {
+                            tui.set_status("switching model");
+                            let _ = ui_cmd.send(WorkerCmd::SetModel(model.to_string()));
+                        }
+                    } else if let Some(resume_id) = sel.strip_prefix("resume:") {
+                        let real = resume_id
+                            .split(" · ")
+                            .next()
+                            .unwrap_or(resume_id)
+                            .to_string();
+                        tui.set_status("restoring session");
+                        let _ = ui_cmd.send(WorkerCmd::ResumeSession(real));
+                    } else if let Some(skill) = sel.strip_prefix("skills:") {
+                        apply_skill_selection(tui, skill);
+                    } else if let Some(agent) = sel.strip_prefix("agents:") {
+                        apply_agent_selection(tui, agent);
+                    } else if let Some(row) = sel.strip_prefix("checkpoints:") {
+                        // Rows are "#<n> <id> · …", so the branch ref is the
+                        // second field. Branching clones the session, so the
+                        // original is never at risk.
+                        let cp_ref = row.split_whitespace().nth(1).unwrap_or(row).to_string();
+                        tui.set_status("branching from checkpoint");
+                        let _ = ui_cmd.send(WorkerCmd::BranchCheckpoint(cp_ref));
+                    } else if let Some(what) = sel.strip_prefix("session_menu:") {
+                        // `/session` root menu: rename · search · list · delete.
+                        match what.split(" · ").next().unwrap_or("") {
+                            "rename" => {
+                                tui.pending_session = Some(tuiapp::SessionAction::Rename);
+                                tui.open_input_modal(tuiapp::InputModal::new(
+                                    "Rename session",
+                                    "Enter a new name for the current session. Leave blank to clear.",
+                                    false,
+                                ));
+                                tui.set_status("enter a session name");
+                            }
+                            "search" => {
+                                tui.pending_session = Some(tuiapp::SessionAction::Search);
+                                tui.open_input_modal(tuiapp::InputModal::new(
+                                    "Search sessions",
+                                    "Type a keyword to match against session names and ids.",
+                                    false,
+                                ));
+                                tui.set_status("search sessions by keyword");
+                            }
+                            "list" => {
+                                tui.set_status("loading sessions");
+                                let _ = ui_cmd.send(WorkerCmd::ListSessions);
+                            }
+                            "delete" => {
+                                let items = Session::list_recent(30)
+                                    .into_iter()
+                                    .map(|(id, name, created, preview)| {
+                                        let label = name
+                                            .map(|n| format!("{id} · {n}"))
+                                            .unwrap_or_else(|| id.clone());
+                                        format!("{label} · {} · {preview}", fmt_unix_date(created))
+                                    })
+                                    .collect::<Vec<_>>();
+                                if items.is_empty() {
+                                    tui.push(Entry::Info("no saved sessions to delete".into()));
+                                } else {
+                                    tui.open_picker("session_delete_list", items);
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else if let Some(id) = sel.strip_prefix("session_delete_list:") {
+                        let real = session_id_from_row(id);
+                        tui.pending_delete = Some(real);
+                        tui.open_picker(
+                            "session_delete_confirm",
+                            vec!["YES, delete it".to_string(), "no, keep it".to_string()],
+                        );
+                    } else if let Some(choice) = sel.strip_prefix("session_delete_confirm:") {
+                        if choice.trim_start().to_lowercase().starts_with("yes") {
+                            if let Some(id) = tui.pending_delete.take() {
+                                tui.set_status("deleting session");
+                                let _ = ui_cmd.send(WorkerCmd::DeleteSession(id));
+                            }
+                        } else {
+                            tui.pending_delete = None;
+                            tui.set_status("delete cancelled");
+                        }
+                    } else if let Some(image) = sel.strip_prefix("image:") {
+                        let _ = ui_cmd.send(WorkerCmd::QueueImage(image.to_string()));
+                    } else if let Some(mode_label) = sel.strip_prefix("approvals:") {
+                        apply_mode_by_label(tui, &ui_cmd, mode_label);
+                    } else if let Some(effort) = sel.strip_prefix("reasoning:") {
+                        apply_reasoning_by_label(tui, &ui_cmd, effort);
+                    } else if let Some(name) = sel.strip_prefix("theme:") {
+                        if crate::theme::set(name) {
+                            tui.set_status(format!("theme: {name}"));
+                            let _ = ui_cmd.send(WorkerCmd::SetTheme(name.to_string()));
+                        } else {
+                            tui.push(Entry::Error(format!("unknown theme '{name}'")));
+                        }
+                    } else if let Some(kind) = sel.strip_prefix("effect:") {
+                        let k = crate::effects::EffectKind::parse(Some(kind));
+                        tui.fx.set(k);
+                        tui.set_status(format!("effect: {}", k.as_str()));
+                        let _ = ui_cmd.send(WorkerCmd::SetEffect(k.as_str().to_string()));
+                    } else if let Some(what) = sel.strip_prefix("provider_menu:") {
+                        // `/provider` root menu: add · use · edit.
+                        match what.split(" · ").next().unwrap_or("") {
+                            "add" => {
+                                let items = PROVIDER_PRESETS
+                                    .iter()
+                                    .map(|p| format!("{} · {}", p.name, p.base_url))
+                                    .collect();
+                                tui.open_picker("provider_add", items);
+                            }
+                            "use" => {
+                                tui.set_status("loading providers");
+                                let _ = ui_cmd.send(WorkerCmd::PickProvider(ProviderMenu::Use));
+                            }
+                            "edit" => {
+                                tui.set_status("loading providers");
+                                let _ = ui_cmd.send(WorkerCmd::PickProvider(ProviderMenu::Edit));
+                            }
+                            _ => {}
+                        }
+                    } else if let Some(label) = sel.strip_prefix("provider_add:") {
+                        // Add step 1: preset picked. Custom providers first ask
+                        // for a base URL; everything else goes straight to the
+                        // API-key dialog. Keyless free providers (aitopia,
+                        // powerbrain) are saved immediately with
+                        // their bundled default model.
+                        match parse_preset_label(label) {
+                            Some((key, base_url)) => {
+                                // Keyless free providers skip the key/model
+                                // dialogs and save immediately with their
+                                // bundled default model.
+                                let free = match find_preset(&key) {
+                                    Some(p) if is_free_kind(p.kind) => {
+                                        let model = p.model;
+                                        if model.is_empty() {
+                                            tui.push(Entry::Error(
+                                                "free provider preset missing a model".into(),
+                                            ));
+                                            true
+                                        } else {
+                                            tui.set_status(format!("saving {key}…"));
+                                            let _ = ui_cmd.send(WorkerCmd::FinishProviderSetup {
+                                                name: key.clone(),
+                                                base_url: base_url.clone(),
+                                                model: model.to_string(),
+                                                api_key: String::new(),
+                                            });
+                                            true
+                                        }
+                                    }
+                                    _ => false,
+                                };
+                                if free {
+                                    // Handled above — nothing more to collect.
+                                } else {
+                                    begin_provider_key_setup(tui, &key, &base_url);
+                                }
+                            }
+                            None => tui.push(Entry::Error("bad provider preset".into())),
+                        }
+                    } else if let Some(models) = sel.strip_prefix("models:") {
+                        // Add final step: model chosen from the authenticated
+                        // catalog (the key was already proven to get here).
+                        let model_choice = tui
+                            .pending_setup
+                            .as_mut()
+                            .filter(|ps| ps.kind == tuiapp::SetupKind::Add)
+                            .map(|ps| (ps.name.clone(), ps.base_url.clone(), ps.api_key.clone()));
+                        if let Some((name, base_url, api_key)) = model_choice {
+                            if models == MANUAL_MODEL_ITEM {
+                                // Hidden/new model not in the catalog — type it.
+                                tui.open_input_modal(tuiapp::InputModal::new(
+                                    format!("Model id — {name}"),
+                                    "Catalogs lag behind: type the exact model id (e.g. stealth/ox-alpha) and press Enter.",
+                                    false,
+                                ));
+                                tui.set_status("enter model id");
+                            } else if models.starts_with('(') {
+                                // Defensive: any other special entry reopens the dialog.
+                                tui.open_input_modal(tuiapp::InputModal::new(
+                                    format!("Model id — {name}"),
+                                    "Type the exact model id and press Enter.",
+                                    false,
+                                ));
+                            } else {
+                                tui.push(Entry::User(format!("model: {models}")));
+                                tui.pending_setup = None;
+                                tui.set_status("saving provider…");
+                                let _ = ui_cmd.send(WorkerCmd::FinishProviderSetup {
+                                    name,
+                                    base_url,
+                                    model: models.to_string(),
+                                    api_key: api_key.unwrap_or_default(),
+                                });
+                            }
+                        }
+                    } else if let Some(label) = sel.strip_prefix("provider_use:") {
+                        // Menu → use: label is "{name} · {model}".
+                        if let Some((name, _)) = parse_preset_label(label) {
+                            tui.set_status(format!("switching to {name}"));
+                            let _ = ui_cmd.send(WorkerCmd::UseProvider(name));
+                        }
+                    } else if let Some(label) = sel.strip_prefix("provider_edit:") {
+                        // Menu → edit: pick the provider, then choose a field.
+                        if let Some((name, _)) = parse_preset_label(label) {
+                            tui.edit_target = Some(name.clone());
+                            tui.open_picker(
+                                "provider_edit_field",
+                                vec![
+                                    format!("replace api key · {name}"),
+                                    format!("change model · {name}"),
+                                ],
+                            );
+                        }
+                    } else if let Some(label) = sel.strip_prefix("provider_edit_field:") {
+                        if let Some((field, name)) = parse_preset_label(label) {
+                            if field == "replace api key" {
+                                tui.pending_setup = Some(tuiapp::ProviderSetup::edit_key(&name));
+                                tui.open_input_modal(tuiapp::InputModal::new(
+                                    format!("New API key — {name}"),
+                                    "Paste the replacement key and press Enter.\nIt is verified live; on failure the old key stays.",
+                                    true,
+                                ));
+                                tui.set_status(format!("{name}: enter new API key"));
+                            } else if field == "change model" {
+                                tui.set_status(format!("fetching models for {name}…"));
+                                let _ = ui_cmd.send(WorkerCmd::EditProviderPickModel(name));
+                            }
+                        }
+                    } else if let Some(model) = sel.strip_prefix("edit model:") {
+                        let provider = tui.edit_target.clone();
+                        if let Some(provider) = provider {
+                            if model == MANUAL_MODEL_ITEM {
+                                // Hidden/new model — type the exact id.
+                                tui.open_input_modal(tuiapp::InputModal::new(
+                                    format!("Model id — {provider}"),
+                                    "Type the exact model id (e.g. stealth/ox-alpha) and press Enter.",
+                                    false,
+                                ));
+                                tui.set_status("enter model id");
+                            } else if model.starts_with('(') {
+                                tui.set_status("model kept");
+                                tui.edit_target = None;
+                            } else {
+                                tui.edit_target = None;
+                                tui.set_status("saving model…");
+                                let _ = ui_cmd.send(WorkerCmd::EditProviderSetModel {
+                                    provider,
+                                    model: model.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+                KeyAction::Submit(text) => {
+                    if text.starts_with('/') {
+                        if !handle_slash(tui, &ui_cmd, &text) {
+                            let _ = ui_approve.send(false); // unblock pending approval
+                            let _ = ui_cmd.send(WorkerCmd::Quit);
+                            return false;
+                        }
+                    } else if tui.needs_setup && !text.starts_with('#') && !text.starts_with('!') {
+                        // Nothing configured yet — steer to /provider add
+                        // instead of failing on the first API call.
+                        tui.push(Entry::Info(
+                            "no provider configured — run /provider and choose add\n(pick tokenrouter/openai/openrouter/… → API key → model)".into(),
+                        ));
+                    } else if tui.is_busy() && !text.starts_with('#') && !text.starts_with('!') {
+                        // Queue the next prompt while the agent works — it runs
+                        // automatically when the current turn finishes.
+                        tui.push(Entry::User(format!("⏳ {text}")));
+                        tui.dash.messages += 1;
+                        tui.set_status("queued");
+                        let prompt = if text.starts_with('/') {
+                            text
+                        } else {
+                            expand_at_files(&text, &project_cwd)
+                        };
+                        let _ = ui_cmd.send(WorkerCmd::Submit(prompt));
+                    } else {
+                        let mut prompt = text.clone();
+                        // Custom commands take priority over built-ins.
+                        if prompt.starts_with('/') {
+                            let (head, rest) = match prompt.split_once(' ') {
+                                Some((h, r)) => (h.to_string(), r.to_string()),
+                                None => (prompt.clone(), String::new()),
+                            };
+                            let bare = head.trim_start_matches('/');
+                            if let Some(cc) = custom_lookup(tui, bare) {
+                                tui.push(Entry::User(text.clone()));
+                                prompt = render_command_template(&cc.template, &rest, &project_cwd);
+                                let _ = ui_cmd.send(WorkerCmd::Submit(prompt));
+                                return true;
+                            }
+                        }
+                        if text.starts_with('#') || text.starts_with('!') {
+                            // Memory notes / shell passthrough run even while busy.
+                        } else {
+                            tui.push(Entry::User(text.clone()));
+                            tui.dash.messages += 1;
+                        }
+                        tui.set_status("thinking");
+                        // Custom commands already inline @files inside
+                        // render_command_template; memory notes and shell
+                        // passthrough keep their literal text.
+                        let expanded = if !prompt.starts_with('/')
+                            && !prompt.starts_with('#')
+                            && !prompt.starts_with('!')
+                        {
+                            expand_at_files(&prompt, &project_cwd)
+                        } else {
+                            prompt
+                        };
+                        let _ = ui_cmd.send(WorkerCmd::Submit(expanded));
+                    }
+                }
+                KeyAction::InputSubmit(value) => {
+                    // Answer from the centered input dialog (API key / model / session).
+                    if let Some(action) = tui.pending_session.take() {
+                        match action {
+                            tuiapp::SessionAction::Rename => {
+                                let _ = ui_cmd.send(WorkerCmd::RenameSession(value));
+                            }
+                            tuiapp::SessionAction::Search => {
+                                let kw = value.trim().to_string();
+                                if kw.is_empty() {
+                                    tui.set_status("empty keyword — cancelled");
+                                } else {
+                                    tui.set_status(format!("searching sessions: '{kw}'"));
+                                    let _ = ui_cmd.send(WorkerCmd::ListSessionsByKeyword(kw));
+                                }
+                            }
+                        }
+                    } else if value.trim().is_empty() {
+                        tui.set_status("empty input — cancelled");
+                        tui.pending_setup = None;
+                    } else if let Some(ps) = tui.pending_setup.as_mut() {
+                        match (&ps.kind, &ps.api_key) {
+                            (tuiapp::SetupKind::Add, None) if ps.need_base_url => {
+                                // Custom provider: first submit was the base URL.
+                                let base_url = value.clone();
+                                let key_name = ps.name.clone();
+                                ps.base_url = value;
+                                ps.need_base_url = false;
+                                tui.push(Entry::User(format!("base_url: {base_url}")));
+                                tui.open_input_modal(tuiapp::InputModal::new(
+                                    format!("API key — {key_name}"),
+                                    "Paste your API key (blank only if the server is local) and press Enter.",
+                                    true,
+                                ));
+                                tui.set_status(format!("{key_name}: enter API key"));
+                            }
+                            (tuiapp::SetupKind::Add, None) => {
+                                // Key answered → prove it via authenticated catalog.
+                                ps.api_key = Some(value.clone());
+                                let base_url = ps.base_url.clone();
+                                tui.push(Entry::User(format!("api key: {}", mask_key(&value))));
+                                tui.set_status("fetching models…");
+                                let _ = ui_cmd.send(WorkerCmd::SetupListModels {
+                                    base_url,
+                                    api_key: value,
+                                });
+                            }
+                            (tuiapp::SetupKind::Add, Some(_)) => {
+                                // Manual model id (catalog unavailable or hidden model).
+                                let (name, base_url) = (ps.name.clone(), ps.base_url.clone());
+                                let api_key = ps.api_key.clone().unwrap_or_default();
+                                tui.push(Entry::User(format!("model: {value}")));
+                                tui.pending_setup = None;
+                                tui.set_status("saving provider…");
+                                let _ = ui_cmd.send(WorkerCmd::FinishProviderSetup {
+                                    name,
+                                    base_url,
+                                    model: value,
+                                    api_key,
+                                });
+                            }
+                            (tuiapp::SetupKind::EditKey, _) => {
+                                let provider = ps.name.clone();
+                                tui.push(Entry::User(format!("api key: {}", mask_key(&value))));
+                                tui.pending_setup = None;
+                                tui.set_status("verifying new key…");
+                                let _ = ui_cmd.send(WorkerCmd::FinishEditApiKey {
+                                    provider,
+                                    api_key: value,
+                                });
+                            }
+                        }
+                    } else if let Some(provider) = tui.edit_target.take() {
+                        // Typed model id from /provider edit → change model.
+                        tui.push(Entry::User(format!("model: {value}")));
+                        tui.set_status("saving model…");
+                        let _ = ui_cmd.send(WorkerCmd::EditProviderSetModel {
+                            provider,
+                            model: value,
+                        });
+                    } else {
+                        // Typed model id from /model → live session switch.
+                        tui.push(Entry::User(format!("model: {value}")));
+                        tui.set_status("switching model");
+                        let _ = ui_cmd.send(WorkerCmd::SetModel(value));
+                    }
+                }
+                KeyAction::None => {}
+            }
+            true
+        });
+
+        if keep_going.is_err() {
+            return Err(anyhow::anyhow!("tui loop failed"));
+        }
+
+        // The worker sends its final state right before exiting — give it a
+        // moment so the shell goodbye can offer an exact resume command.
+        use std::sync::mpsc::RecvTimeoutError;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut exit_id = initial_id;
+        let mut exit_messages = 0usize;
+        while std::time::Instant::now() < deadline {
+            match wait_events
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_millis(100))
+            {
+                Ok(WorkerEvent::SessionSummary { id, messages }) => {
+                    exit_id = id;
+                    exit_messages = messages;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(_) => break, // worker gone without a summary
+            }
+        }
+        Ok(SessionExit {
+            id: exit_id,
+            messages: exit_messages,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_config(
+        cwd: PathBuf,
+        config: Config,
+        cli_provider: Option<&str>,
+        cli_base_url: Option<&str>,
+        cli_api_key: Option<&str>,
+        cli_model: Option<&str>,
+        mode_override: Option<ApprovalMode>,
+    ) -> Result<Self> {
+        let active = config.resolve_active(cli_provider, cli_base_url, cli_api_key, cli_model)?;
+        if let Some(t) = &config.theme {
+            crate::theme::set(t);
+        }
+        // BUILD is the default collaboration mode (auto-approve edits,
+        // ask for commands) unless overridden by flag/config.
+        let mode = mode_override
+            .or_else(|| {
+                config
+                    .approval_mode
+                    .as_deref()
+                    .and_then(ApprovalMode::parse)
+            })
+            .unwrap_or(ApprovalMode::AutoEdit);
+        let mut client = ChatClient::new(
+            &active.base_url,
+            &active.api_key,
+            &active.headers,
+            active.reasoning_effort.clone(),
+            &active.kind,
+        )?;
+        // Transient failures are worth waiting out: a flaky connection
+        // shouldn't fail a coding task.
+        if let Some(n) = config.limits.max_retries {
+            client.set_max_retries(n as usize);
+        }
+        let permissions = config.permission.clone();
+        // Install user-defined specialists from [agents.*] before any
+        // delegate schema is built.
+        crate::agents::install_custom(&config.agents);
+        let ctx_window = config.context_window.unwrap_or(128_000);
+        let agent = Agent::with_config(
+            client,
+            active.model.clone(),
+            cwd.clone(),
+            mode,
+            permissions,
+            &config,
+            ctx_window,
+        );
+
+        let session = Session::new();
+        let ui = TermUi::new()?;
+        Ok(Self {
+            config,
+            active,
+            agent,
+            session,
+            ui,
+            cwd,
+            ctx_window,
+            pending_images: vec![],
+            pending_transcript: vec![],
+            pending_custom_cmds: vec![],
+        })
+    }
+
+    /// Bare App with a placeholder provider — used when config resolution
+    /// fails on a fresh install so the interactive wizard can still run.
+    pub fn build_unconfigured(cwd: PathBuf) -> Result<Self> {
+        let config = Config::load().unwrap_or_default();
+        let active = ActiveProvider {
+            name: "unconfigured".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            kind: String::new(),
+            model: String::new(),
+            headers: Default::default(),
+            sources: Default::default(),
+            reasoning_effort: None,
+        };
+        let client = ChatClient::new("http://localhost:0/v1", "", &active.headers, None, "openai")?;
+        let agent = Agent::new(
+            client,
+            String::new(),
+            cwd.clone(),
+            ApprovalMode::AutoEdit,
+            crate::permissions::Permissions::default(),
+        );
+        let session = Session::new();
+        let ui = TermUi::new()?;
+        let ctx_window = 128_000;
+        Ok(Self {
+            config,
+            active,
+            agent,
+            session,
+            ui,
+            cwd,
+            ctx_window,
+            pending_images: vec![],
+            pending_transcript: vec![],
+            pending_custom_cmds: vec![],
+        })
+    }
+
+    pub fn restore_session(&mut self, sess: Session) {
+        let restored = sess.restore();
+        let kept: Vec<Message> = restored
+            .into_iter()
+            .filter(|m| m.role != "system")
+            .collect();
+        if !kept.is_empty() {
+            self.agent.messages.extend(kept);
+            self.agent.messages.push(Message::user(
+                "[Resuming previous session above. Continue where it left off.]".to_string(),
+            ));
+        }
+        self.session = sess;
+        // Restore the spend already paid for in this session: otherwise
+        // `max_cost_usd` gets a fresh allowance on every resume.
+        self.agent.tot_usage = (self.session.prompt_tokens, self.session.completion_tokens);
+        // Replay the restored conversation into the TUI so the user actually
+        // SEES their earlier work instead of a blank transcript.
+        self.pending_transcript = transcript_entries(&self.agent.messages);
+        println!("{}", "· resumed previous session".dark_grey());
+    }
+
+    fn persist(&mut self) {
+        // Auto-title the session from its first assistant reply (if the user
+        // hasn't named it via /session rename).
+        if self.session.name.is_none() {
+            let title = self
+                .agent
+                .messages
+                .iter()
+                .filter(|m| m.role == "assistant")
+                .filter_map(|m| m.content.clone())
+                .find(|c| !c.trim().is_empty())
+                .map(|c| c.split_whitespace().take(8).collect::<Vec<_>>().join(" "));
+            if let Some(t) = title {
+                let cleaned: String = t.chars().take(48).collect();
+                if !cleaned.is_empty() {
+                    self.session.name = Some(cleaned);
+                }
+            }
+        }
+        self.session.messages = self.agent.messages.clone();
+        // Carry the token totals so `/status` and `[limits]` survive a resume
+        // instead of restarting from zero and letting the budget refill.
+        self.session.prompt_tokens = self.agent.tot_usage.0;
+        self.session.completion_tokens = self.agent.tot_usage.1;
+        if let Err(e) = self.session.save() {
+            eprintln!(
+                "{}",
+                format!("warn: could not save session: {e}").dark_grey()
+            );
+        }
+    }
+
+    /// One-shot non-interactive task (exec mode). `images` are data URIs.
+    pub async fn run_once(mut self, task: &str, images: &[String]) -> Result<()> {
+        // `exec` never goes through the worker thread, so this is the only
+        // place MCP can connect. Without it the configured servers would be
+        // silently absent from the toolset in one-shot mode.
+        for f in self.agent.connect_mcp_servers().await {
+            eprintln!("{} MCP server failed: {f}", "·".dark_grey());
+        }
+        for f in self.agent.connect_lsp_servers().await {
+            eprintln!("{} LSP server failed: {f}", "·".dark_grey());
+        }
+        // The banner goes to stdout, so it corrupts `--json` output and
+        // buries the answer under 12 rows of art. Both flags mean "stdout is
+        // machine/human readable output only".
+        if !self.ui.json_out && !self.ui.quiet {
+            print_banner();
+        }
+        self.ui.begin_turn();
+        let res = self.agent.run_turn(task, images, &mut self.ui, None).await;
+        self.ui.end_turn();
+        res?;
+        self.persist();
+        Ok(())
+    }
+}
+
+/// Apply one worker event to the transcript.
+fn apply_worker_event(tui: &mut Tui, ev: WorkerEvent) {
+    match ev {
+        WorkerEvent::Ev(AgentEvent::Content(d)) => {
+            tui.set_busy(true, "streaming");
+            tui.push_stream_text(&d);
+        }
+        WorkerEvent::Ev(AgentEvent::Reasoning(d)) => {
+            tui.set_busy(true, "reasoning");
+            tui.push_reasoning_text(&d);
+        }
+        WorkerEvent::Ev(AgentEvent::ToolStart { name, summary }) => {
+            tui.clear_status();
+            tui.set_busy(true, format!("running {name}"));
+            tui.push(Entry::ToolCall { name, summary });
+        }
+        WorkerEvent::Ev(AgentEvent::ToolDone { name, ok, preview }) => {
+            if ok {
+                tui.set_busy(true, "working");
+            }
+            tui.push(Entry::ToolResult { name, ok, preview });
+        }
+        WorkerEvent::Ev(AgentEvent::ToolEdit { name, files }) => {
+            tui.push(Entry::ToolDiff { name, files });
+        }
+        WorkerEvent::Ev(AgentEvent::Usage(u)) => {
+            let total = tui.ctx_total;
+            tui.set_usage(u.prompt_tokens, total);
+            tui.dash.record_usage(u.prompt_tokens, u.completion_tokens);
+            tui.set_status(format!("ctx {} tok", u.prompt_tokens));
+        }
+        WorkerEvent::Ev(AgentEvent::Todo(todos)) => {
+            tui.dash.set_plan(&todos);
+            let done = todos.iter().filter(|t| t.status == "completed").count();
+            tui.set_status(format!("plan {done}/{}", todos.len()));
+        }
+        WorkerEvent::Ev(AgentEvent::Notice(msg)) => {
+            // Transient provider hiccup: show it in the status line without
+            // polluting the transcript, and keep the spinner alive.
+            tui.set_status(msg);
+        }
+        WorkerEvent::NeedApproval(desc) => {
+            tui.open_approval(desc);
+        }
+        WorkerEvent::Busy(b) => {
+            if b {
+                tui.set_busy(true, "working");
+            } else {
+                tui.set_busy(false, "working");
+                tui.clear_status();
+            }
+        }
+        WorkerEvent::Info(s) => tui.push(Entry::Info(s)),
+        WorkerEvent::Error(s) => tui.push(Entry::Error(s)),
+        WorkerEvent::Reload {
+            text,
+            entries,
+            session_id,
+            session_name,
+        } => {
+            let count = entries.len();
+            tui.entries.clear();
+            for e in entries {
+                tui.push(e);
+            }
+            tui.push(Entry::Info(text));
+            tui.dash.session_id = crate::tui::shorten_session_id(&session_id);
+            tui.dash
+                .set_name(session_name.as_deref().unwrap_or_default());
+            tui.dash.messages = count;
+        }
+        // Consumed by tui_main after the loop ends; never reaches the UI.
+        WorkerEvent::SessionSummary { .. } => {}
+        WorkerEvent::Pick { title, items } => tui.open_picker_rows(title, items),
+        WorkerEvent::SessionName(name) => {
+            tui.dash.set_name(&name);
+        }
+        WorkerEvent::SessionDeleted(id) => {
+            tui.push(Entry::Info(format!("session '{id}' deleted")));
+        }
+        WorkerEvent::ProviderSwitched { provider, model } => {
+            tui.dash.set_endpoint(&provider, &model);
+            tui.needs_setup = false;
+            tui.subtitle = format!("· {provider}");
+            tui.set_status(format!("{provider} · {model}"));
+        }
+        WorkerEvent::SetupModelsFailed => {
+            // The key didn't survive an authenticated catalog fetch — offer
+            // the manual-model dialog, but don't pretend it's verified.
+            if let Some(ps) = tui.pending_setup.as_ref() {
+                if ps.kind == tuiapp::SetupKind::Add {
+                    let name = ps.name.clone();
+                    tui.open_input_modal(tuiapp::InputModal::new(
+                        format!("Model id — {name}"),
+                        "Couldn't list models with that key.\nType the exact model id (e.g. gpt-4o-mini) and press Enter to save anyway.",
+                        false,
+                    ));
+                    tui.set_status("enter model id");
+                }
+            }
+        }
+    }
+}
+
+/// Rebuild visible transcript entries from stored conversation messages so
+/// a resumed session shows everything that happened earlier — not just feed
+/// it into the model's context silently.
+pub fn transcript_entries(messages: &[Message]) -> Vec<Entry> {
+    use std::collections::HashMap;
+    let mut out: Vec<Entry> = Vec::new();
+    // tool_call id -> tool name, so results can be paired with their calls.
+    let mut open_calls: HashMap<String, String> = HashMap::new();
+    const MARKERS: &[&str] = &["[Resuming previous session", "[Conversation was compacted"];
+    for m in messages {
+        match m.role.as_str() {
+            "user" => {
+                let Some(text) = &m.content else { continue };
+                if MARKERS.iter().any(|k| text.starts_with(k)) {
+                    continue; // housekeeping markers are noise on screen
+                }
+                out.push(Entry::User(text.clone()));
+            }
+            "assistant" => {
+                for tc in &m.tool_calls {
+                    open_calls.insert(tc.id.clone(), tc.tool_name().to_string());
+                    let summary = tools::parse_tool_action(tc.tool_name(), &tc.function.arguments)
+                        .map(|a| a.describe())
+                        .unwrap_or_else(|_| tc.function.arguments.chars().take(80).collect());
+                    out.push(Entry::ToolCall {
+                        name: tc.function.name.clone(),
+                        summary,
+                    });
+                }
+                if let Some(text) = &m.content {
+                    if !text.trim().is_empty() {
+                        out.push(Entry::Assistant(text.clone()));
+                    }
+                }
+            }
+            "tool" => {
+                let name = m
+                    .tool_call_id
+                    .as_ref()
+                    .and_then(|id| open_calls.get(id).cloned())
+                    .unwrap_or_else(|| "tool".into());
+                let body = m.content.clone().unwrap_or_default();
+                let failed = body.starts_with("Error") || body.starts_with("Command failed");
+                out.push(Entry::ToolResult {
+                    name,
+                    ok: !failed,
+                    preview: body.lines().take(4).collect::<Vec<_>>().join("\n"),
+                });
+            }
+            _ => {} // system prompts stay invisible
+        }
+    }
+    // Keep memory bounded on marathon sessions — show the most recent tail.
+    if out.len() > 400 {
+        out.drain(..out.len() - 400);
+    }
+    out
+}
+
+fn tui_mode_of(mode: ApprovalMode) -> tuiapp::Mode {
+    match mode {
+        ApprovalMode::Suggest => tuiapp::Mode::Plan,
+        ApprovalMode::AutoEdit => tuiapp::Mode::Build,
+        ApprovalMode::FullAuto => tuiapp::Mode::FullAuto,
+    }
+}
+
+/// Display helper: collapse $HOME to ~ for dashboard cwd rows.
+fn home_shortened(p: &std::path::Path) -> String {
+    match dirs::home_dir() {
+        Some(home) => p
+            .strip_prefix(&home)
+            .map(|rel| format!("~/{}", rel.display()))
+            .unwrap_or_else(|_| p.display().to_string()),
+        None => p.display().to_string(),
+    }
+}
+
+/// Find a user-defined command by bare name in the TUI's loaded lists.
+fn custom_lookup(tui: &Tui, name: &str) -> Option<CustomCmd> {
+    let (_, description) = tui.custom_cmds.iter().find(|(n, _)| n == name)?;
+    let template = tui.custom_templates.get(name)?.clone();
+    Some(CustomCmd {
+        name: name.to_string(),
+        description: description.clone(),
+        template,
+    })
+}
+
+/// Cycle PLAN → BUILD → FULL AUTO and inform the worker.
+fn cycle_mode(tui: &mut Tui, cmd: &Sender<WorkerCmd>) {
+    tui.mode = tui.mode.next();
+    let label = match tui.mode {
+        tuiapp::Mode::Plan => "PLAN — read-only exploration, no edits",
+        tuiapp::Mode::Build => "BUILD — edits auto-approved",
+        tuiapp::Mode::FullAuto => "FULL AUTO — everything approved",
+    };
+    tui.set_status(label);
+    tui.push(Entry::Info(format!("switched to {}", tui.mode.label())));
+    let _ = cmd.send(WorkerCmd::SetApprovalMode(ApprovalMode::from_tui_mode(
+        tui.mode,
+    )));
+}
+
+/// Apply a mode chosen from the /approvals picker.
+fn apply_mode_by_label(tui: &mut Tui, cmd: &Sender<WorkerCmd>, label: &str) {
+    let mode = match label.to_lowercase().as_str() {
+        "plan (read-only)" | "plan" => tuiapp::Mode::Plan,
+        "build (auto-edit)" | "build" => tuiapp::Mode::Build,
+        "full auto" | "full-auto" | "fullauto" => tuiapp::Mode::FullAuto,
+        _ => return,
+    };
+    tui.mode = mode;
+    let _ = cmd.send(WorkerCmd::SetApprovalMode(ApprovalMode::from_tui_mode(
+        mode,
+    )));
+    tui.push(Entry::Info(format!(
+        "approval mode set to {}",
+        mode.label()
+    )));
+}
+
+/// Translate a `/reasoning` picker label to the `reasoning_effort` value it
+/// represents. `normal`/`default` clear the hint (model's built-in behavior);
+/// `bogus` labels return `None` without an error message.
+fn reasoning_label_to_effort(label: &str) -> Option<String> {
+    match label.to_lowercase().as_str() {
+        "normal (model default)" | "normal" | "default (model default)" | "default" => None,
+        "low" => Some("low".into()),
+        "medium" => Some("medium".into()),
+        "high" => Some("high".into()),
+        "max" => Some("max".into()),
+        _ => None,
+    }
+}
+
+/// Every label the `/reasoning` picker may ever offer (the visible list is
+/// model-aware — see [`reasoning_choices`]); also the accepted set for
+/// validation of any label that does come back.
+const REASONING_CHOICES: &[&str] = &[
+    "normal (model default)",
+    "default (model default)",
+    "low",
+    "medium",
+    "high",
+    "max",
+];
+
+/// Whether the active model accepts `reasoning_effort: "max"` (the xAI
+/// spelling, used by Grok reasoning models). Everything else speaks the
+/// OpenAI sector-standard low/medium/high only.
+fn model_offers_max_effort(model: &str, provider: &str) -> bool {
+    let m = model.to_lowercase();
+    m.contains("grok") || provider.eq_ignore_ascii_case("xai")
+}
+
+/// The `/reasoning` picker entries for the active model — `max` is only
+/// shown when the model supports it instead of advertising a level many
+/// models can't consume.
+fn reasoning_choices(model: &str, provider: &str) -> Vec<String> {
+    let mut out = vec![
+        "normal (model default)".into(),
+        "low".into(),
+        "medium".into(),
+        "high".into(),
+    ];
+    if model_offers_max_effort(model, provider) {
+        out.push("max".into());
+    }
+    out
+}
+
+/// True when the label is one of the picker's own entries (used to tell a
+/// valid "clear the hint" choice apart from an unknown label).
+fn is_reasoning_choice(label: &str) -> bool {
+    REASONING_CHOICES
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(label))
+}
+
+/// Translate a `/reasoning` picker label into a `SetReasoning` worker
+/// command. `normal`/`default` clear the hint (the model's built-in
+/// behavior); the rest map to the OpenAI `reasoning_effort` levels.
+fn apply_reasoning_by_label(tui: &mut Tui, cmd: &Sender<WorkerCmd>, label: &str) {
+    if !is_reasoning_choice(label) {
+        tui.push(Entry::Error(format!("unknown reasoning level '{label}'")));
+        return;
+    }
+    let effort = reasoning_label_to_effort(label);
+    let _ = cmd.send(WorkerCmd::SetReasoning(effort.clone()));
+    tui.set_status(
+        effort
+            .map(|e| format!("reasoning: {e}"))
+            .unwrap_or_else(|| "reasoning: model default".into()),
+    );
+}
+
+/// Slash-command dispatch inside the TUI — forwards to the worker./// Returns false when the loop should quit.
+fn handle_slash(tui: &mut Tui, cmd: &Sender<WorkerCmd>, line: &str) -> bool {
+    let mut parts = line.split_whitespace();
+    let name = parts
+        .next()
+        .unwrap_or("")
+        .trim_start_matches('/')
+        .to_lowercase();
+    let arg: Vec<&str> = parts.collect();
+    match name.as_str() {
+        "help" => {
+            tui.push(Entry::Info(
+                "Type / to open command autocomplete — filter by typing, ↑/↓ to move, Tab or Enter to complete.\n\n\
+                 SESSION\n\
+                   /model        pick a model                                    /status    provider · model · info\n\
+                   /reasoning    thinking depth (auto-detected: normal·low·med·high[·max])      /approvals switch approval mode (or Tab)\n\
+                   /agents       pick a specialist agent (or /agents <name>)      /session   rename · search · list\n\
+                   /skills       search & pick a skill to use                   /resume    restore a previous session\n\
+                   /compact      summarize history to free context              /export    save transcript as markdown\n\
+                   /retry        re-run the previous task                       /image     attach an image\n\
+                   /clear        reset conversation                             /quit      exit Laudacode\n\
+                 FILES & DIFF\n\
+                   /diff         show uncommitted git changes\n\
+                   /review       specialist review of uncommitted changes\n\
+                   /undo [N]     revert file changes from the last N turns\n\
+                   /init         analyze the project and write AGENTS.md\n\
+                 PROVIDER\n\
+                   /provider     menu: add · use · edit · list\n\
+                 INPUT & KEYS\n\
+                   @file         attach a file (contents inlined)\n\
+                   #note         save a memory into AGENTS.md\n\
+                   !<command>    run a shell command locally (no agent)\n\
+                   /your-cmd     custom commands from .laudacode/commands/*.md\n\
+                   ctrl+o        expand recent tool output      esc   interrupt / release scroll\n\
+                   enter send · tab mode · ↑↓ history · ctrl+c quit"
+                    .into(),
+            ));
+        }
+        "approvals" | "mode" => {
+            // Static picker opened directly on the UI thread; selection
+            // arrives back as OpenSlash("approvals:<label>").
+            tui.open_picker(
+                "approvals",
+                vec![
+                    "plan (read-only)".into(),
+                    "build (auto-edit)".into(),
+                    "full auto".into(),
+                ],
+            );
+        }
+        "agents" | "team" | "agent" => {
+            // A roster dump is not a selection. `/agents` opens a picker;
+            // `/agents <name>` skips straight to prefilling the composer.
+            match arg.first() {
+                None => {
+                    let items = crate::agents::all_roles()
+                        .into_iter()
+                        .map(|r| {
+                            // The tag sits next to the name, not at the end:
+                            // appended, a long description truncates it away,
+                            // and read-only-ness is the thing you most need to
+                            // see before picking.
+                            let tag = if r.read_only { " (read-only)" } else { "" };
+                            format!("{}{tag} · {}", r.name, r.description)
+                        })
+                        .collect::<Vec<_>>();
+                    if items.is_empty() {
+                        tui.push(Entry::Error("no agents registered".into()));
+                    } else {
+                        tui.open_picker("agents", items);
+                    }
+                }
+                Some(name) => {
+                    if crate::agents::find_role(name).is_none() {
+                        let known = crate::agents::all_roles()
+                            .into_iter()
+                            .map(|r| r.name)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        tui.push(Entry::Error(format!(
+                            "unknown agent '{name}' — try: {known}"
+                        )));
+                    } else {
+                        apply_agent_selection(tui, name);
+                    }
+                }
+            }
+        }
+        "skills" => {
+            if arg.is_empty() {
+                let _ = cmd.send(WorkerCmd::ListSkills);
+            } else {
+                tui.push(Entry::Error(
+                    "usage: /skills — opens a searchable skill picker".into(),
+                ));
+            }
+        }
+        "compact" => {
+            tui.set_status("compacting");
+            let _ = cmd.send(WorkerCmd::Compact);
+        }
+        "clear" | "new" => {
+            let _ = cmd.send(WorkerCmd::Clear);
+            tui.entries.clear();
+            tui.push(Entry::Info("conversation cleared".into()));
+        }
+        "quit" | "exit" => {
+            tui.push(Entry::Info("goodbye".into()));
+            return false;
+        }
+        "provider" => match arg.first().copied() {
+            // Bare `/provider` → fully interactive menu.
+            None => {
+                tui.open_picker(
+                    "provider_menu",
+                    vec![
+                        "add · connect a new provider".to_string(),
+                        "use · switch active provider".to_string(),
+                        "edit · change a key or model".to_string(),
+                        "list · show configured providers".to_string(),
+                    ],
+                );
+            }
+            Some("add" | "setup") => {
+                let items = PROVIDER_PRESETS
+                    .iter()
+                    .map(|p| format!("{} · {}", p.name, p.base_url))
+                    .collect();
+                tui.open_picker("provider_add", items);
+            }
+            Some("use") => {
+                let _ = cmd.send(WorkerCmd::PickProvider(ProviderMenu::Use));
+            }
+            Some("edit") => {
+                let _ = cmd.send(WorkerCmd::PickProvider(ProviderMenu::Edit));
+            }
+            Some("cancel" | "abort") => {
+                tui.input_modal = None;
+                if tui.pending_setup.take().is_some() || tui.edit_target.take().is_some() {
+                    tui.set_status("provider setup cancelled");
+                    tui.push(Entry::Info("provider setup cancelled".into()));
+                } else {
+                    tui.set_status("nothing to cancel");
+                }
+            }
+            Some("list" | "ls") => {
+                let _ = cmd.send(WorkerCmd::ListProviders);
+            }
+            Some("show" | "status") => {
+                let _ = cmd.send(WorkerCmd::ShowProvider);
+            }
+            Some(other) => {
+                tui.push(Entry::Error(format!(
+                    "unknown /provider subcommand '{other}' — open the menu with plain /provider \
+                     (add · use · edit · list)"
+                )));
+            }
+        },
+        "model" => {
+            tui.set_status("fetching models");
+            let _ = cmd.send(WorkerCmd::ListModels);
+        }
+        "reasoning" | "effort" | "thinking" => {
+            // Model-aware picker, same shape as /approvals; the choice comes
+            // back as OpenSlash("reasoning:<label>"). "max" is the xAI
+            // spelling and is only offered when the active model speaks it.
+            tui.open_picker(
+                "reasoning",
+                reasoning_choices(&tui.dash.model, &tui.dash.provider),
+            );
+        }
+        "retry" => {
+            tui.set_status("retrying");
+            let _ = cmd.send(WorkerCmd::Retry);
+        }
+        "resume" | "continue" => {
+            tui.set_status("loading sessions");
+            let _ = cmd.send(WorkerCmd::ListSessions);
+        }
+        "checkpoint" => {
+            // Optional label; the worker snapshots the live conversation.
+            let label = arg.join(" ");
+            let _ = cmd.send(WorkerCmd::Checkpoint(if label.is_empty() {
+                None
+            } else {
+                Some(label)
+            }));
+        }
+        "checkpoints" => {
+            let _ = cmd.send(WorkerCmd::ListCheckpoints);
+        }
+        "branch" => match arg.first().copied() {
+            Some(cp) => {
+                tui.set_status("branching");
+                let _ = cmd.send(WorkerCmd::BranchCheckpoint(cp.to_string()));
+            }
+            None => {
+                // Same picker as /checkpoints: rows are labelled #1, #2, …
+                tui.set_status("pick a checkpoint to branch from");
+                let _ = cmd.send(WorkerCmd::ListCheckpoints);
+            }
+        },
+        "session" => {
+            // `/session` groups every session-management action under one roof.
+            match arg.first().copied() {
+                None => {
+                    tui.open_picker(
+                        "session_menu",
+                        vec![
+                            "rename · name this session".to_string(),
+                            "search · find sessions by keyword".to_string(),
+                            "list · show all saved sessions".to_string(),
+                            "delete · remove a session".to_string(),
+                        ],
+                    );
+                }
+                Some("rename") => {
+                    if let Some(name) = arg.get(1) {
+                        let _ = cmd.send(WorkerCmd::RenameSession((*name).to_string()));
+                    } else {
+                        tui.pending_session = Some(tuiapp::SessionAction::Rename);
+                        tui.open_input_modal(tuiapp::InputModal::new(
+                            "Rename session",
+                            "Enter a new name for the current session. Leave blank to clear.",
+                            false,
+                        ));
+                        tui.set_status("enter a session name");
+                    }
+                }
+                Some("search" | "find") => {
+                    if let Some(kw) = arg.get(1) {
+                        tui.set_status(format!("searching sessions: '{kw}'"));
+                        let _ = cmd.send(WorkerCmd::ListSessionsByKeyword((*kw).to_string()));
+                    } else {
+                        tui.pending_session = Some(tuiapp::SessionAction::Search);
+                        tui.open_input_modal(tuiapp::InputModal::new(
+                            "Search sessions",
+                            "Type a keyword to match against session names and ids.",
+                            false,
+                        ));
+                        tui.set_status("search sessions by keyword");
+                    }
+                }
+                Some("list" | "ls" | "show") => {
+                    tui.set_status("loading sessions");
+                    let _ = cmd.send(WorkerCmd::ListSessions);
+                }
+                Some("delete" | "rm" | "del") => {
+                    if let Some(id) = arg.get(1) {
+                        // Direct delete with an explicit id/name needs confirmation.
+                        tui.pending_delete = Some((*id).to_string());
+                        tui.open_picker(
+                            "session_delete_confirm",
+                            vec!["YES, delete it".to_string(), "no, keep it".to_string()],
+                        );
+                    } else {
+                        // No id given — list sessions to delete.
+                        let items = Session::list_recent(30)
+                            .into_iter()
+                            .map(|(id, name, created, preview)| {
+                                let label = name
+                                    .map(|n| format!("{id} · {n}"))
+                                    .unwrap_or_else(|| id.clone());
+                                format!("{label} · {} · {preview}", fmt_unix_date(created))
+                            })
+                            .collect::<Vec<_>>();
+                        if items.is_empty() {
+                            tui.push(Entry::Info("no saved sessions to delete".into()));
+                        } else {
+                            tui.open_picker("session_delete_list", items);
+                        }
+                    }
+                }
+                Some(other) => {
+                    tui.push(Entry::Error(format!(
+                        "unknown /session subcommand '{other}' — use rename · search · list · delete"
+                    )));
+                }
+            }
+        }
+        "image" => match arg.first() {
+            Some(path) => {
+                let _ = cmd.send(WorkerCmd::QueueImage((*path).to_string()));
+            }
+            None => tui.push(Entry::Error("usage: /image <path/to/file.png>".into())),
+        },
+        "export" => {
+            let _ = cmd.send(WorkerCmd::Export);
+        }
+        "init" => {
+            let _ = cmd.send(WorkerCmd::InitAgentsMd);
+        }
+        "status" => {
+            tui.set_status("gathering status");
+            let _ = cmd.send(WorkerCmd::Status);
+        }
+        "mcp" => {
+            let _ = cmd.send(WorkerCmd::Mcp);
+        }
+        "lsp" => {
+            let _ = cmd.send(WorkerCmd::Lsp);
+        }
+        "diff" => {
+            tui.set_status("computing diff");
+            let _ = cmd.send(WorkerCmd::Diff);
+        }
+        "review" => {
+            tui.set_status("reviewing uncommitted changes");
+            let _ = cmd.send(WorkerCmd::Review);
+        }
+        "theme" => {
+            let items = crate::theme::names()
+                .into_iter()
+                .map(String::from)
+                .collect();
+            tui.open_picker("theme", items);
+        }
+        "effect" => {
+            let items = crate::effects::EffectKind::all()
+                .iter()
+                .map(|k| k.as_str().to_string())
+                .collect();
+            tui.open_picker("effect", items);
+        }
+        "undo" => {
+            // /undo reverts the last turn; /undo N reverts N turns back.
+            let n = arg
+                .first()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(1);
+            tui.set_status(if n == 1 {
+                "reverting last turn".to_string()
+            } else {
+                format!("reverting last {n} turns")
+            });
+            let _ = cmd.send(WorkerCmd::Undo(n));
+        }
+        other => {
+            tui.push(Entry::Error(format!(
+                "unknown command '/{other}' — try /help"
+            )));
+        }
+    }
+    true
+}
+
+/// A `/skills` picker choice: stage the skill in the composer (like an
+/// @-mention) — the user finishes the prompt; nothing is auto-submitted.
+fn apply_skill_selection(tui: &mut Tui, skill: &str) {
+    let name = skill
+        .split(" — ")
+        .next()
+        .unwrap_or(skill)
+        .trim()
+        .to_string();
+    let phrase = format!("Use the '{name}' skill — ");
+    if tui.input.trim().is_empty() {
+        tui.input = phrase;
+    } else {
+        if !tui.input.ends_with(' ') {
+            tui.input.push(' ');
+        }
+        tui.input.push_str(&phrase);
+    }
+    tui.cursor_end();
+    tui.set_status("skill added — finish your prompt and press Enter");
+}
+
+/// Put a specialist to work: seed the composer with an explicit delegation
+/// request and let the user type the task. Delegation is a `delegate` tool call
+/// made by the orchestrator, so this is a prompt, not a mode switch — the
+/// agent registry has no "become this agent" concept and inventing one would
+/// be a lie about what the selector does.
+fn apply_agent_selection(tui: &mut Tui, name: &str) {
+    let name = name.split(" · ").next().unwrap_or(name).trim();
+    let phrase = format!("Delegate to the {name} agent: ");
+    if tui.input.trim().is_empty() {
+        tui.input = phrase;
+    } else {
+        if !tui.input.ends_with(' ') {
+            tui.input.push(' ');
+        }
+        tui.input.push_str(&phrase);
+    }
+    tui.cursor_end();
+    tui.set_status(format!(
+        "{name} selected — describe the task and press Enter"
+    ));
+}
+
+/// Keys that are obviously placeholders — warn instead of failing opaquely.
+fn placeholder_key(key: &str) -> bool {
+    let k = key.trim().to_lowercase();
+    if k.is_empty() {
+        return true;
+    }
+    const PLACEHOLDERS: &[&str] = &[
+        "<key>",
+        "your-key",
+        "your_key",
+        "yourkey",
+        "changeme",
+        "change-me",
+        "xxx",
+        "placeholder",
+        "sk-test",
+        "sk-xxx",
+        "sk-...",
+        "none",
+        "null",
+    ];
+    PLACEHOLDERS
+        .iter()
+        .any(|p| k == *p || (k.starts_with("sk-") && p.starts_with("sk-") && k.contains(&p[3..])))
+}
+
+/// Print the brand banner to a plain terminal (exec mode, wizard).
+/// The one-line identity shown when no logo fits `width`: the name, plus the
+/// version when both fit with a gap between them. The name is the last thing
+/// to go, so a pathologically narrow terminal still shows something
+/// recognizable.
+fn compact_identity(width: u16) -> (String, String) {
+    let (name, version) = ("LaudaCode", format!("v{}", env!("CARGO_PKG_VERSION")));
+    let w = width as usize;
+    if w == 0 {
+        return (String::new(), String::new());
+    }
+    if w >= name.len() + 2 + version.len() {
+        (name.to_string(), version)
+    } else {
+        (name.chars().take(w).collect(), String::new())
+    }
+}
+
+pub fn print_banner() {
+    use crossterm::style::Color as CT;
+    // Theme-driven gradient; branding sits in the right-hand identity block.
+    fn to_ct(c: ratatui::style::Color) -> CT {
+        use ratatui::style::Color as RC;
+        match c {
+            RC::Rgb(r, g, b) => CT::Rgb { r, g, b },
+            RC::Black => CT::Black,
+            RC::White => CT::White,
+            RC::Gray => CT::Grey,
+            RC::DarkGray => CT::DarkGrey,
+            RC::Red => CT::Red,
+            RC::LightRed => CT::DarkRed,
+            RC::Green => CT::Green,
+            RC::LightGreen => CT::DarkGreen,
+            RC::Yellow => CT::Yellow,
+            RC::LightYellow => CT::DarkYellow,
+            RC::Blue => CT::Blue,
+            RC::LightBlue => CT::DarkBlue,
+            RC::Cyan => CT::Cyan,
+            RC::LightCyan => CT::DarkCyan,
+            _ => CT::Green,
+        }
+    }
+    // Respect the real terminal width so a wide logo can never wrap. A
+    // zero/unknown size (some ptys and Android terms report 0) is treated as
+    // "unlimited" rather than "no room" — losing the banner is worse than
+    // letting it wrap.
+    let width = match crossterm::terminal::size() {
+        Ok((w, _)) if w > 0 => w,
+        _ => u16::MAX,
+    };
+    // Too narrow for even the most compact logo: fall back to the same
+    // one-line identity the TUI shows on small screens, so the splash can
+    // never wrap.
+    if !crate::tui::any_logo_fits(width) {
+        let t = crate::theme::get();
+        let (name, version) = compact_identity(width);
+        let mut line = name.with(to_ct(t.accent)).bold().to_string();
+        if !version.is_empty() {
+            line.push_str(&format!("  {}", version.with(to_ct(t.dim))));
+        }
+        println!("{line}\n");
+        return;
+    }
+    let art = crate::tui::pick_logo(width);
+    // Reuse the TUI's own composition so the splash and the banner band are
+    // pixel-identical: same logo, same identity block, same centering.
+    for line in crate::tui::banner_lines(art) {
+        let mut out = String::new();
+        for span in line.spans {
+            let text: &str = span.content.as_ref();
+            match span.style.fg {
+                // The TUI pads with unstyled spaces; keep those plain.
+                None => out.push_str(text),
+                Some(c) => out.push_str(&text.with(to_ct(c)).bold().to_string()),
+            }
+        }
+        println!("{out}");
+    }
+    println!();
+}
+
+// ---------------------------------------------------------------------------
+// Provider management helpers (shared with CLI)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Provider management helpers (shared with CLI)
+// ---------------------------------------------------------------------------
+
+/// Run a future on a throwaway current-thread runtime.
+pub fn block_current<F: std::future::Future>(fut: F) -> Result<F::Output> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    Ok(rt.block_on(fut))
+}
+
+// ---------------------------------------------------------------------------
+// Prompt history (~/.local/share/laudacode/sessions/history.txt)
+// ---------------------------------------------------------------------------
+
+fn history_path() -> PathBuf {
+    Session::dir().join("history.txt")
+}
+
+/// Load prompts saved by previous sessions for ↑/↓ recall.
+pub fn load_prompt_history() -> Vec<String> {
+    std::fs::read_to_string(history_path())
+        .map(|raw| {
+            raw.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Persist one submitted prompt (best-effort; history is a convenience).
+fn append_prompt_history(line: &str) {
+    if line.trim().is_empty() {
+        return;
+    }
+    let path = history_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{line}");
+    }
+    // The file holds everything the user typed — owner-only on unix.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    trim_history_file(&path);
+}
+
+/// Keep the on-disk history within [`HISTORY_MAX`] lines.
+fn trim_history_file(path: &PathBuf) {
+    const MAX_LINES: usize = 500;
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let lines: Vec<&str> = raw.lines().collect();
+    if lines.len() <= MAX_LINES {
+        return;
+    }
+    let keep = lines[lines.len() - MAX_LINES..].join("\n");
+    let _ = std::fs::write(path, keep + "\n");
+}
+
+/// Known OpenAI-compatible endpoints surfaced by `/provider add` (TUI) and
+/// the interactive `laudacode provider add` flow. OpenRouter first — it is
+/// the default recommendation (widest model catalog).
+/// A built-in provider preset offered by the `/provider add` pickers.
+pub struct ProviderPreset {
+    /// Identifier used as the provider name / picker label.
+    pub name: &'static str,
+    /// Default base URL (empty for "custom").
+    pub base_url: &'static str,
+    /// Transport kind: "openai" or a keyless built-in ("aitopia",
+    /// "powerbrain").
+    pub kind: &'static str,
+    /// Default model id (empty = the user must supply one).
+    pub model: &'static str,
+}
+
+pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
+    ProviderPreset {
+        name: "openrouter",
+        base_url: "https://openrouter.ai/api/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "tokenrouter",
+        base_url: "https://api.tokenrouter.com/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "openai",
+        base_url: "https://api.openai.com/v1",
+        kind: "openai",
+        model: "",
+    },
+    // Google's OpenAI-compatible endpoint. Gemini 3+ models gate tool calls
+    // on thought signatures — the client detects this endpoint and handles
+    // the signature roundtrip automatically.
+    ProviderPreset {
+        name: "gemini",
+        base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "anthropic",
+        base_url: "https://api.anthropic.com/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "groq",
+        base_url: "https://api.groq.com/openai/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "deepseek",
+        base_url: "https://api.deepseek.com/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "together",
+        base_url: "https://api.together.xyz/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "xai",
+        base_url: "https://api.x.ai/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "mistral",
+        base_url: "https://api.mistral.ai/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "cerebras",
+        base_url: "https://api.cerebras.ai/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "moonshot",
+        base_url: "https://api.moonshot.ai/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "zai",
+        base_url: "https://api.z.ai/api/paas/v4",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "novita",
+        base_url: "https://api.novita.ai/v3/openai",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "chutes",
+        base_url: "https://llm.chutes.ai/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "ollama",
+        base_url: "http://localhost:11434/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "ollamacloud",
+        base_url: "https://ollama.com/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "lmstudio",
+        base_url: "http://localhost:1234/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "aitopia",
+        base_url: "https://extensions.aitopia.ai/ai/send",
+        kind: "aitopia",
+        model: "AITOPIA",
+    },
+    ProviderPreset {
+        name: "powerbrain",
+        base_url: "https://powerbrainai.com/app/backend/api/api.php",
+        kind: "powerbrain",
+        model: "gpt-5",
+    },
+    // --- OpenAI-compatible providers (base URLs cross-checked against
+    // vendor docs and several independent provider registries, 2026-09).
+    // Every one of these speaks the plain chat-completions wire format, so
+    // they need no transport of their own — only a base URL.
+    ProviderPreset {
+        name: "fireworks",
+        base_url: "https://api.fireworks.ai/inference/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "sambanova",
+        base_url: "https://api.sambanova.ai/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "deepinfra",
+        base_url: "https://api.deepinfra.com/v1/openai",
+        kind: "openai",
+        model: "",
+    },
+    // Chat only: Perplexity serves /chat/completions but has no /models
+    // endpoint, so the model picker cannot list here — type the id instead.
+    ProviderPreset {
+        name: "perplexity",
+        base_url: "https://api.perplexity.ai",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "hyperbolic",
+        base_url: "https://api.hyperbolic.xyz/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "nvidia",
+        base_url: "https://integrate.api.nvidia.com/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "baseten",
+        base_url: "https://inference.baseten.co/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "upstage",
+        base_url: "https://api.upstage.ai/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "siliconflow",
+        base_url: "https://api.siliconflow.cn/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "minimax",
+        base_url: "https://api.minimax.io/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "huggingface",
+        base_url: "https://router.huggingface.co/v1",
+        kind: "openai",
+        model: "",
+    },
+    // The azure.com host no longer resolves; models.github.ai is the live one.
+    ProviderPreset {
+        name: "githubmodels",
+        base_url: "https://models.github.ai/inference",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "qwen",
+        base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        kind: "openai",
+        model: "",
+    },
+    ProviderPreset {
+        name: "custom",
+        base_url: "",
+        kind: "openai",
+        model: "",
+    },
+];
+
+/// Look up a built-in preset by name, if any.
+pub fn find_preset(name: &str) -> Option<&'static ProviderPreset> {
+    PROVIDER_PRESETS.iter().find(|p| p.name == name)
+}
+
+/// True for the keyless built-in free providers (no API key, no OpenAI wire
+/// format). Empty kind means OpenAI-compatible.
+pub fn is_free_kind(kind: &str) -> bool {
+    kind != "openai"
+}
+
+/// Split a `"{key} · {base_url}"` picker label back into its parts.
+///
+/// A row with no detail is normal, not malformed: the `custom` preset has no
+/// base URL until the wizard asks for one, and structured rows drop an empty
+/// detail from the wire. Both yield an empty second half.
+fn parse_preset_label(label: &str) -> Option<(String, String)> {
+    if label.trim().is_empty() {
+        return None;
+    }
+    // Split before trimming: a row with an empty detail still ends in " · ",
+    // and trimming first would swallow the separator.
+    match label.split_once(" · ") {
+        Some((k, u)) => Some((k.trim().to_string(), u.trim().to_string())),
+        None => Some((label.trim().to_string(), String::new())),
+    }
+}
+
+/// Extra headers a preset needs beyond the bearer token.
+///
+/// openrouter wants attribution for its public rankings; nothing else needs
+/// anything special.
+fn preset_headers(base_url: &str) -> std::collections::BTreeMap<String, String> {
+    let mut h: std::collections::BTreeMap<String, String> = Default::default();
+    if base_url.contains("openrouter") {
+        h.extend(parse_headers(
+            "HTTP-Referer: https://github.com/Anon4You/Laudacode, X-Title: Laudacode",
+        ));
+    }
+    h
+}
+
+/// Collect a base URL (custom presets only) and then the API key for a
+/// provider being added.
+fn begin_provider_key_setup(tui: &mut tuiapp::Tui, key: &str, base_url: &str) {
+    let ps = tuiapp::ProviderSetup::add(key, base_url);
+    let need_base_url = ps.need_base_url;
+    tui.pending_setup = Some(ps);
+    if need_base_url {
+        tui.open_input_modal(tuiapp::InputModal::new(
+            "Base URL — custom",
+            "Paste the full OpenAI-compatible base URL (e.g. https://api.example.com/v1) and press Enter.",
+            false,
+        ));
+        tui.set_status("custom: enter base URL");
+    } else {
+        tui.open_input_modal(tuiapp::InputModal::new(
+            format!("API key — {key}"),
+            format!("Paste your {key} API key and press Enter.\nIt is masked, stored only in this machine's config, and verified with a live test request before anything is saved."),
+            true,
+        ));
+        tui.set_status(format!("{key}: enter API key"));
+    }
+}
+
+/// Mask an API key for transcript display: keep only a short tail.
+fn mask_key(key: &str) -> String {
+    let n = key.chars().count();
+    if n <= 8 {
+        "••••".into()
+    } else {
+        let tail: String = key.chars().skip(n - 4).collect();
+        format!("••••••••{tail}")
+    }
+}
+
+/// Prepend the manual-entry option to any model list so hidden/new models
+/// that are absent from the catalog can still be typed by id.
+fn with_manual_model_entry(mut models: Vec<String>) -> Vec<String> {
+    models.truncate(200);
+    models.insert(0, MANUAL_MODEL_ITEM.into());
+    models
+}
+
+/// Rebuild the live client for an already-resolved provider. The reasoning
+/// dialect (OpenRouter extension vs OpenAI param vs Google Gemini) is
+/// detected from the endpoint itself — never hardcoded per provider name.
+pub fn rebuild_client(active: &ActiveProvider) -> Result<ChatClient> {
+    ChatClient::new(
+        &active.base_url,
+        &active.api_key,
+        &active.headers,
+        active.reasoning_effort.clone(),
+        &active.kind,
+    )
+}
+
+/// Prove a candidate provider's key + model with a real 1-token completion
+/// BEFORE it is persisted (shared by TUI setup and CLI `provider add|edit`).
+/// Local servers are skipped. Nothing is written by this function.
+pub fn verify_provider_creds(p: &Provider) -> Result<()> {
+    let local = p.base_url.contains("localhost") || p.base_url.contains("127.0.0.1");
+    if local || p.api_key.is_empty() {
+        return Ok(());
+    }
+    println!("· verifying key and model with a live test request…");
+    let client = rebuild_client(&ActiveProvider {
+        name: "verify".into(),
+        base_url: p.base_url.clone(),
+        api_key: p.api_key.clone(),
+        kind: p.kind.clone(),
+        model: p.model.clone(),
+        headers: p.headers.clone(),
+        sources: Default::default(),
+        reasoning_effort: None,
+    })?;
+    let res = block_current(client.probe_chat(&p.model))?;
+    res.with_context(|| {
+        format!(
+            "NOT saved — nothing changed. Check the key/model for {} and retry",
+            p.base_url
+        )
+    })?;
+    Ok(())
+}
+
+fn switch_to(
+    cfg: &mut Config,
+    agent: &mut Agent,
+    name: &str,
+    _cwd: &PathBuf,
+) -> Result<ActiveProvider> {
+    if !cfg.providers.contains_key(name) {
+        bail!("provider '{name}' not found");
+    }
+    let active = cfg.resolve_active(Some(name), None, None, None)?;
+    agent.client = rebuild_client(&active)?;
+    agent.model = active.model.clone();
+    cfg.active_provider = Some(name.to_string());
+    cfg.save()?;
+    Ok(active)
+}
+
+/// Complete an in-TUI `/provider add`: persist the provider, activate it and
+/// hot-swap the live client. Returns a human-readable summary (including a
+/// soft connectivity check that never fails the setup).
+fn finish_provider_setup(
+    app: &mut App,
+    rt: &tokio::runtime::Runtime,
+    name: &str,
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+) -> Result<String> {
+    let sanitized = sanitize_name(name)?;
+    let is_local = base_url.contains("localhost") || base_url.contains("127.0.0.1");
+    // Presets carry the transport kind + default model; anything not in the
+    // table (or typed in by hand) is treated as OpenAI-compatible (keyed).
+    let kind = find_preset(name)
+        .map(|p| p.kind)
+        .unwrap_or("openai")
+        .to_string();
+    let free = is_free_kind(&kind);
+    anyhow::ensure!(
+        !api_key.trim().is_empty() || is_local || free,
+        "API key required for {base_url} (local servers and the built-in free providers may leave it blank)"
+    );
+    anyhow::ensure!(!model.trim().is_empty(), "model name required");
+
+    let p = Provider {
+        base_url: base_url.to_string(),
+        api_key: api_key.trim().to_string(),
+        kind,
+        model: model.trim().to_string(),
+        headers: preset_headers(base_url),
+        reasoning_effort: None,
+    };
+
+    // Prove the key AND the chosen model with a real completion BEFORE saving
+    // anything — a public /models endpoint can't tell a good key from a bad
+    // one. Keyless free providers are verified through their own transport.
+    if !is_local {
+        let probe = ChatClient::new(base_url, &p.api_key, &p.headers, None, &p.kind)?;
+        rt.block_on(probe.probe_chat(&p.model)).with_context(|| {
+            format!("'{sanitized}' was NOT saved — nothing changed. Fix the model and retry /provider add")
+        })?;
+    }
+
+    // Re-running /provider add for the same preset overwrites cleanly.
+    app.config.providers.insert(sanitized.clone(), p);
+    let active = switch_to(&mut app.config, &mut app.agent, &sanitized, &app.cwd)?;
+    app.active = active;
+
+    Ok(format!(
+        "saved and activated '{sanitized}' · {} · {}\n· verified working with a live test request",
+        app.active.base_url, app.agent.model
+    ))
+}
+
+/// `/provider edit` → change model: persist it on the stored provider and
+/// hot-swap the live agent when that provider is currently active.
+fn edit_provider_model(app: &mut App, provider: &str, model: &str) -> Result<String> {
+    let model = model.trim();
+    anyhow::ensure!(!model.is_empty(), "model name required");
+    {
+        let p = app
+            .config
+            .providers
+            .get_mut(provider)
+            .ok_or_else(|| anyhow::anyhow!("provider '{provider}' not found"))?;
+        p.model = model.to_string();
+    }
+    let is_active = app.config.active_provider.as_deref() == Some(provider);
+    if is_active {
+        // Re-resolve + rebuild so the running session uses it immediately.
+        let active = switch_to(&mut app.config, &mut app.agent, provider, &app.cwd)?;
+        app.active = active;
+    } else {
+        app.config.save()?;
+    }
+    Ok(format!(
+        "model for '{provider}' set to {model}{}",
+        if is_active { " (live)" } else { "" }
+    ))
+}
+
+/// `/provider edit` → replace the stored API key of a configured provider.
+/// When the provider is active, the live client is rebuilt and verified;
+/// when verification fails the old key is restored instead of saving a
+/// broken one.
+fn finish_edit_api_key(
+    app: &mut App,
+    rt: &tokio::runtime::Runtime,
+    provider: &str,
+    api_key: &str,
+) -> Result<String> {
+    anyhow::ensure!(
+        !api_key.trim().is_empty(),
+        "API key cannot be empty — setup cancelled, old key kept"
+    );
+    let is_local = app
+        .config
+        .providers
+        .get(provider)
+        .map(|p| p.base_url.contains("localhost") || p.base_url.contains("127.0.0.1"))
+        .unwrap_or(false);
+    let old_key = {
+        let p = app
+            .config
+            .providers
+            .get_mut(provider)
+            .ok_or_else(|| anyhow::anyhow!("provider '{provider}' not found"))?;
+        std::mem::replace(&mut p.api_key, api_key.trim().to_string())
+    };
+    let is_active = app.config.active_provider.as_deref() == Some(provider);
+    if is_active {
+        let active = switch_to(&mut app.config, &mut app.agent, provider, &app.cwd)?;
+        app.active = active;
+        if !is_local {
+            // Prove the new key with a real completion before keeping it;
+            // roll back to the old key on failure.
+            let model = app.agent.model.clone();
+            if let Err(e) = rt.block_on(app.agent.client.probe_chat(&model)) {
+                if let Some(p) = app.config.providers.get_mut(provider) {
+                    p.api_key = old_key;
+                }
+                let active = switch_to(&mut app.config, &mut app.agent, provider, &app.cwd)?;
+                app.active = active;
+                bail!("key rejected ({e:#}) — old key restored");
+            }
+        }
+        Ok(format!(
+            "API key updated for '{provider}' — verified with a live test request"
+        ))
+    } else {
+        // Inactive provider: verify before saving so a typo can't poison
+        // the config for later.
+        let (base_url, model, headers) = {
+            let p = app.config.providers.get(provider).unwrap();
+            (p.base_url.clone(), p.model.clone(), p.headers.clone())
+        };
+        if !is_local {
+            let probe = ChatClient::new(&base_url, api_key.trim(), &headers, None, "openai")?;
+            rt.block_on(probe.probe_chat(&model))
+                .with_context(|| "key rejected — old key kept unchanged")?;
+        }
+        app.config.save()?;
+        Ok(format!(
+            "API key updated for '{provider}' (not active — /provider use to switch)"
+        ))
+    }
+}
+
+pub fn list_providers(cfg: &Config) {
+    let active_name = cfg.active_provider.clone().unwrap_or_default();
+    if cfg.providers.is_empty() {
+        println!("{}", "no providers configured yet".dark_grey());
+        println!("run: laudacode provider add");
+        return;
+    }
+    for (name, p) in &cfg.providers {
+        let star = if *name == active_name {
+            format!("{}", "*".cyan().bold())
+        } else {
+            " ".to_string()
+        };
+        println!(
+            "{star} {:<14} {} ({})",
+            name.clone().bold(),
+            p.base_url.clone().dark_grey(),
+            p.model.clone().green()
+        );
+    }
+}
+
+/// Interactive (or flag-driven) provider creation. Returns the provider name.
+pub fn add_provider_flow(cfg: &mut Config, name_arg: Option<&str>) -> Result<String> {
+    println!("{}", "── add provider ──".bold());
+
+    let name = match name_arg {
+        Some(n) => sanitize_name(n)?,
+        None => sanitize_name(&prompt_line("name", "")?)?,
+    };
+    if cfg.providers.contains_key(&name) {
+        bail!("provider '{name}' already exists (use /provider edit {name})");
+    }
+
+    let presets: &[ProviderPreset] = PROVIDER_PRESETS;
+    println!("{}", "pick a preset:".dark_grey());
+    for (i, p) in presets.iter().enumerate() {
+        println!("  {}) {:<11} {}", i + 1, p.name, p.base_url.dark_grey());
+    }
+    let choice = prompt_line("preset number", "1")?;
+    let idx: usize = choice.trim().parse().unwrap_or(1);
+    let (base_default, preset_name, preset_kind, preset_model) =
+        match presets.get(idx.saturating_sub(1)) {
+            Some(p) => (p.base_url, p.name, p.kind, p.model),
+            None => ("", "", "openai", ""),
+        };
+
+    let base_url = prompt_line("base_url", base_default)?;
+    let model = prompt_line("model", preset_model)?;
+    let is_local = base_url.contains("localhost") || base_url.contains("127.0.0.1");
+    // Keyless presets (aitopia/powerbrain), Ollama/LM Studio and
+    // any local server always allow a blank key; for anything else (including
+    // a custom provider) the key is only optional when the base URL is local.
+    let allow_blank_key = is_free_kind(preset_kind)
+        || preset_name == "ollama"
+        || preset_name == "lmstudio"
+        || is_local;
+    let api_key = if allow_blank_key {
+        prompt_line("api_key (blank for none)", "")?
+    } else {
+        prompt_hidden("api_key")?
+    };
+
+    let headers = prompt_line("extra headers (Key: Value, …)", "")?;
+    let header_map = parse_headers(&headers);
+
+    let kind = if is_free_kind(preset_kind) {
+        preset_kind.to_string()
+    } else {
+        "openai".to_string()
+    };
+    let p = Provider {
+        base_url,
+        api_key,
+        kind,
+        model,
+        headers: header_map,
+        reasoning_effort: None,
+    };
+    // Prove the key/model before touching the config file.
+    verify_provider_creds(&p)?;
+    cfg.providers.insert(name.clone(), p);
+    cfg.save()?;
+    println!("· saved provider '{}'", name.clone().green());
+    Ok(name)
+}
+
+pub fn edit_provider_flow(cfg: &mut Config, name: &str) -> Result<()> {
+    let p = cfg
+        .providers
+        .get(name)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("provider '{name}' not found"))?;
+    println!(
+        "{}",
+        format!("── editing '{name}' (enter = keep current) ──").bold()
+    );
+    let base_url = prompt_line("base_url", &p.base_url)?;
+    let model = prompt_line("model", &p.model)?;
+    let api_key_in = prompt_line("api_key (enter = keep stored key)", "")?;
+    let headers = prompt_line(
+        "extra headers",
+        &p.headers
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )?;
+    let updated = Provider {
+        base_url,
+        model,
+        kind: p.kind.clone(),
+        api_key: if api_key_in.is_empty() {
+            p.api_key.clone()
+        } else {
+            api_key_in
+        },
+        headers: parse_headers(&headers),
+        reasoning_effort: p.reasoning_effort.clone(),
+    };
+    // Prove the (possibly unchanged) credentials before saving.
+    verify_provider_creds(&updated)?;
+    cfg.providers.insert(name.to_string(), updated);
+    cfg.save()?;
+    println!(
+        "· updated '{name}' (key stays in {})",
+        Config::toml_path().display()
+    );
+    Ok(())
+}
+
+pub fn parse_headers(s: &str) -> std::collections::BTreeMap<String, String> {
+    let mut map = std::collections::BTreeMap::new();
+    for pair in s.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = pair.split_once(':') {
+            map.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+    map
+}
+
+fn prompt_line(label: &str, default: &str) -> Result<String> {
+    let shown = if default.is_empty() {
+        format!("{label}: ")
+    } else {
+        format!("{label} [{}]: ", default)
+    };
+    match DefaultEditor::new()?.readline(&shown) {
+        Ok(l) => {
+            let t = l.trim().to_string();
+            Ok(if t.is_empty() { default.to_string() } else { t })
+        }
+        Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
+            bail!("cancelled")
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn prompt_hidden(label: &str) -> Result<String> {
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use crossterm::terminal;
+    println!("{}", label.to_string() + ": ");
+    let _ = std::io::stdout().flush();
+    terminal::enable_raw_mode()?;
+    let mut out = String::new();
+    let res = (|| -> Result<String> {
+        loop {
+            if let Event::Key(k) = event::read()? {
+                if k.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match k.code {
+                    KeyCode::Enter => break,
+                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                        bail!("cancelled")
+                    }
+                    KeyCode::Backspace => {
+                        if out.pop().is_some() {
+                            print!("\x08 \x08");
+                            let _ = std::io::stdout().flush();
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        out.push(c);
+                        print!("*");
+                        let _ = std::io::stdout().flush();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(out)
+    })();
+    terminal::disable_raw_mode()?;
+    println!();
+    res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_identity_always_fits_and_keeps_the_name() {
+        for w in 0u16..=80 {
+            let (name, version) = compact_identity(w);
+            if w == 0 {
+                assert!(name.is_empty() && version.is_empty());
+                continue;
+            }
+            // Name + two spaces + version must never exceed the terminal.
+            let len = name.chars().count()
+                + if version.is_empty() {
+                    0
+                } else {
+                    2 + version.chars().count()
+                };
+            assert!(
+                len <= w as usize,
+                "w={w} needs {len} cols: {name:?} {version:?}"
+            );
+            // The name is kept in full whenever there's room, clipped only when
+            // the terminal is narrower than the name itself.
+            let want: String = "LaudaCode".chars().take(w as usize).collect();
+            assert_eq!(name, want, "w={w} mangled the name");
+        }
+        // The version rides along as soon as both fit.
+        let (name, version) = compact_identity(80);
+        assert_eq!(name, "LaudaCode");
+        assert_eq!(version, format!("v{}", env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn empty_answer_and_eof_deny_rather_than_approve() {
+        // A sub-agent asking for approval in exec mode used to treat `""` as
+        // yes, so a bare Enter — or a closed stdin, where read_line yields
+        // Ok(0) and leaves the buffer empty — approved destructive actions.
+        assert_eq!(parse_yes_no(""), Some(false), "bare enter must deny");
+        assert_eq!(parse_yes_no("\n"), Some(false), "just a newline must deny");
+        assert_eq!(parse_yes_no("   "), Some(false), "whitespace must deny");
+        assert_eq!(parse_yes_no("n"), Some(false));
+        assert_eq!(parse_yes_no("no"), Some(false));
+        assert_eq!(parse_yes_no("y"), Some(true));
+        assert_eq!(parse_yes_no("YES"), Some(true));
+        assert_eq!(parse_yes_no("  yes  "), Some(true));
+        assert_eq!(parse_yes_no("maybe"), None, "re-prompt, never a default");
+    }
+
+    #[test]
+    fn every_dispatched_slash_command_is_advertised() {
+        // The dispatcher is a hand-written match; the popup is a separate
+        // hand-maintained table. They drifted once (`/agents` was handled but
+        // unlisted), so pin the dispatcher names against the table.
+        const DISPATCHED: &[&str] = &[
+            "help",
+            "approvals",
+            "agents",
+            "skills",
+            "compact",
+            "clear",
+            "quit",
+            "provider",
+            "model",
+            "reasoning",
+            "retry",
+            "resume",
+            "checkpoint",
+            "checkpoints",
+            "branch",
+            "session",
+            "image",
+            "export",
+            "init",
+            "status",
+            "diff",
+            "review",
+            "theme",
+            "effect",
+            "undo",
+        ];
+        for name in DISPATCHED {
+            let entry = format!("/{name}");
+            assert!(
+                crate::tui::SLASH_COMMANDS.iter().any(|(c, _)| *c == entry),
+                "`{entry}` is dispatched but missing from the slash autocomplete table"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_command_pipeline_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("lc-cmds-{}", std::process::id()));
+        let cmds = dir.join(".laudacode/commands");
+        std::fs::create_dir_all(&cmds).unwrap();
+        std::fs::write(
+            cmds.join("greet.md"),
+            "---\ndescription: say hi\n---\nHello $1 you said: $ARGUMENTS\n",
+        )
+        .unwrap();
+        // Project overrides global on name clash.
+        std::fs::write(cmds.join("review.md"), "Review @notes.md now\n").unwrap();
+        std::fs::write(dir.join("notes.md"), "IMPORTANT NOTE CONTENT").unwrap();
+
+        let loaded = load_custom_commands(&dir);
+        assert_eq!(loaded.len(), 2);
+        let greet = loaded.iter().find(|c| c.name == "greet").unwrap();
+        assert_eq!(greet.description, "say hi");
+
+        let rendered = render_command_template(&greet.template, "Bob extra", &dir);
+        assert!(rendered.contains("Hello Bob"), "{rendered}");
+        assert!(rendered.contains("you said: Bob extra"), "{rendered}");
+
+        let review = loaded.iter().find(|c| c.name == "review").unwrap();
+        let rendered = render_command_template(&review.template, "", &dir);
+        assert!(rendered.contains("IMPORTANT NOTE CONTENT"), "{rendered}");
+        assert!(!rendered.contains("@notes.md") || rendered.contains("--- notes.md ---"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn expand_at_files_inlines_contents_and_skips_unknown() {
+        let dir = std::env::temp_dir().join(format!("lc-expand-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "Hello file").unwrap();
+
+        // Known path inlined between markers.
+        let out = expand_at_files("read @a.txt now", &dir);
+        assert!(out.contains("--- a.txt ---"), "{out}");
+        assert!(out.contains("Hello file"), "{out}");
+        assert!(!out.contains("@a.txt"), "{out}");
+
+        // Unknown path left untouched.
+        let out2 = expand_at_files("see @missing.txt maybe", &dir);
+        assert!(out2.contains("@missing.txt"), "{out2}");
+        assert!(!out2.contains("--- missing.txt ---"), "{out2}");
+
+        // No @ at all passes through unchanged.
+        assert_eq!(expand_at_files("no tokens here", &dir), "no tokens here");
+
+        // Embedded in a word is not expanded (email-like).
+        let out3 = expand_at_files("user@example.com", &dir);
+        assert!(out3.contains("user@example.com"), "{out3}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn header_parsing() {
+        let m = parse_headers("X-A: 1 , , X-B: two words ");
+        assert_eq!(m.get("X-A").map(String::as_str), Some("1"));
+        assert_eq!(m.get("X-B").map(String::as_str), Some("two words"));
+        assert_eq!(m.len(), 2);
+        assert!(parse_headers("").is_empty());
+        assert!(parse_headers("no-colon-here").is_empty());
+    }
+
+    #[test]
+    fn openrouter_preset_is_first_and_labels_roundtrip() {
+        let first = PROVIDER_PRESETS.first().expect("presets non-empty");
+        assert_eq!(first.name, "openrouter");
+        assert_eq!(first.base_url, "https://openrouter.ai/api/v1");
+        assert!(
+            PROVIDER_PRESETS.iter().any(|p| p.name == "tokenrouter"),
+            "tokenrouter stays available"
+        );
+        assert!(
+            PROVIDER_PRESETS
+                .iter()
+                .any(|p| p.name == "custom" && p.base_url.is_empty()),
+            "a custom (bring-your-own-base-url) preset must be offered in the TUI"
+        );
+        // New presets are all https (except the local servers + custom).
+        for p in PROVIDER_PRESETS {
+            let local_or_custom = p.name == "custom" || p.base_url.contains("localhost");
+            assert!(
+                local_or_custom || p.base_url.starts_with("https://"),
+                "preset {} must use https: {}",
+                p.name,
+                p.base_url
+            );
+        }
+        // The major additions the user asked for are present.
+        for k in [
+            "anthropic",
+            "xai",
+            "mistral",
+            "cerebras",
+            "moonshot",
+            "zai",
+            "novita",
+            "chutes",
+            // Added after cross-checking vendor docs and probing each
+            // /models endpoint: a 401/403 proves the path is real, whereas a
+            // 404 means the base URL is wrong and the preset would be dead on
+            // arrival.
+            "fireworks",
+            "sambanova",
+            "deepinfra",
+            "perplexity",
+            "hyperbolic",
+            "nvidia",
+            "baseten",
+            "upstage",
+            "siliconflow",
+            "minimax",
+            "huggingface",
+            "githubmodels",
+        ] {
+            assert!(
+                PROVIDER_PRESETS.iter().any(|p| p.name == k),
+                "preset {k} missing"
+            );
+        }
+        // The keyless free providers are wired up correctly.
+        for k in ["aitopia", "powerbrain"] {
+            let p = find_preset(k).expect("free preset present");
+            assert!(is_free_kind(p.kind), "{k} must be a free kind");
+            assert!(!p.model.is_empty(), "{k} needs a default model");
+        }
+        // Every preset label round-trips through the picker parser.
+        for p in PROVIDER_PRESETS {
+            let parsed = parse_preset_label(&format!("{} · {}", p.name, p.base_url)).unwrap();
+            assert_eq!(parsed, (p.name.to_string(), p.base_url.to_string()));
+        }
+        // A row with no detail is valid, not malformed: `custom` has no base
+        // url until the wizard asks, and structured rows omit an empty detail
+        // from the wire entirely.
+        assert_eq!(
+            parse_preset_label("custom"),
+            Some(("custom".into(), String::new()))
+        );
+        assert_eq!(parse_preset_label("  "), None);
+        assert_eq!(parse_preset_label(""), None);
+    }
+
+    /// Provider rows now carry `name · model · base_url`; the routing code
+    /// splits on the first separator, so the extra context must not shift it.
+    #[test]
+    fn provider_rows_still_route_on_the_name() {
+        let (name, rest) =
+            parse_preset_label("openrouter · stealth/ox-alpha · https://openrouter.ai/api/v1")
+                .expect("provider row must parse");
+        assert_eq!(name, "openrouter");
+        assert!(rest.contains("stealth/ox-alpha") && rest.contains("openrouter.ai"));
+        // And the two-field form used by the edit menu is unaffected.
+        assert_eq!(
+            parse_preset_label("replace api key · openrouter"),
+            Some(("replace api key".into(), "openrouter".into()))
+        );
+    }
+
+    /// Rows lead with the session name, so the id must be found by shape.
+    /// A positional `split(" · ").next()` here silently resolved to the
+    /// name and `/resume` stopped working.
+    #[test]
+    fn session_id_is_found_by_shape_not_position() {
+        let id = "1790480839-8d37e49d2efd";
+        for row in [
+            format!("my chat · {id} · 2025-09-27 · fix the parser"),
+            format!("{id} · 2025-09-27 · fix the parser"),
+            format!("(unnamed) · {id} · 2025-09-27 · hello"),
+            format!("fix parser in src-2e1a · {id} · 2025-09-27 · x"),
+        ] {
+            assert_eq!(session_id_from_row(&row), id, "row: {row}");
+        }
+        // A date must not pass as a timestamp, and a real id still works
+        // when it is the whole row.
+        assert_eq!(session_id_from_row("2025-09-27 · a · b"), "2025-09-27");
+        assert_eq!(session_id_from_row(id), id);
+    }
+
+    #[test]
+    fn checkpoint_rows_carry_an_unambiguous_branch_ref() {
+        // The picker hands back "#<n> <id> · …" and we feed field 2 to
+        // branch_from. If the row shape changes, this must break loudly
+        // rather than branch from "#3".
+        let (_g, dir) = {
+            let guard = crate::session::test_sync::env_lock();
+            let dir = std::env::temp_dir().join(format!(
+                "lc-cp-picker-{}-{}",
+                std::process::id(),
+                crate::session::Session::new().id
+            ));
+            std::env::set_var("LAUDACODE_SESSIONS_DIR", &dir);
+            (guard, dir)
+        };
+        let mut s = crate::session::Session::new();
+        s.messages.push(crate::api::Message::user("hi"));
+        s.create_checkpoint(Some("pre-refactor".into())).unwrap();
+        let row = s.checkpoint_items().remove(0);
+        assert!(row.starts_with("#1 "), "row lost its index: {row}");
+        let cp_ref = row.split_whitespace().nth(1).unwrap().to_string();
+        assert_eq!(cp_ref, s.checkpoints[0].id, "row id must be the branch ref");
+        // And that ref really resolves to the checkpoint we listed.
+        assert!(s.branch_from(&cp_ref).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn agents_opens_a_picker_instead_of_dumping_the_roster() {
+        // Regression: /agents used to print a wall of text, so it looked like
+        // nothing happened. A selection UI is the whole point of the command.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut tui = Tui::new();
+        assert!(handle_slash(&mut tui, &tx, "/agents"));
+        let (title, items) = tui.picker_view().expect("/agents must open a picker");
+        assert_eq!(title, "agents");
+        assert!(!items.is_empty(), "the agent picker is empty");
+        // Every real specialist is offered, and a read-only one says so.
+        for want in ["planner", "researcher", "coder", "reviewer", "tester"] {
+            assert!(
+                items.iter().any(|i| i.to_wire().starts_with(want)),
+                "{want} missing from the picker: {items:?}"
+            );
+        }
+        // The tag must lead (right after the name) so a long description
+        // cannot truncate it away.
+        assert!(
+            items.iter().any(|i| i.to_wire().contains("(read-only)")),
+            "read-only roles are not marked: {items:?}"
+        );
+        assert!(
+            items.iter().all(|i| !i.to_wire().ends_with("read-only")),
+            "the tag drifted to the end where truncation eats it: {items:?}"
+        );
+    }
+
+    #[test]
+    fn agents_with_a_name_stages_a_delegation_prompt() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut tui = Tui::new();
+        assert!(handle_slash(&mut tui, &tx, "/agents coder"));
+        assert!(
+            tui.picker_view().is_none(),
+            "a named agent must skip the picker"
+        );
+        assert_eq!(tui.input, "Delegate to the coder agent: ");
+        // An unknown name is an error, not a silent no-op.
+        let mut tui = Tui::new();
+        assert!(handle_slash(&mut tui, &tx, "/agents nosuchagent"));
+        assert!(
+            tui.input.is_empty(),
+            "a bad name must not touch the composer"
+        );
+
+        // The picker hands back "name · description · read-only", so the
+        // selection path has to strip that back to a bare role name.
+        let mut tui = Tui::new();
+        apply_agent_selection(
+            &mut tui,
+            "planner · Breaks a feature into steps · read-only",
+        );
+        assert_eq!(tui.input, "Delegate to the planner agent: ");
+
+        // And it appends to an existing draft rather than clobbering it.
+        let mut tui = Tui::new();
+        tui.input = "also".into();
+        tui.cursor_end();
+        apply_agent_selection(&mut tui, "tester");
+        assert_eq!(tui.input, "also Delegate to the tester agent: ");
+    }
+
+    #[test]
+    fn key_masking_keeps_only_tail() {
+        assert_eq!(mask_key(""), "••••");
+        assert_eq!(mask_key("short"), "••••");
+        assert_eq!(mask_key("sk-1234567890abcd"), "••••••••abcd");
+    }
+
+    #[test]
+    fn reasoning_labels_map_to_effort_levels() {
+        // The picker offers: normal · default · low · medium · high · max.
+        for label in ["normal (model default)", "default (model default)"] {
+            assert_eq!(reasoning_label_to_effort(label), None);
+        }
+        for (label, want) in [
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("max", "max"),
+        ] {
+            assert_eq!(
+                reasoning_label_to_effort(label).as_deref(),
+                Some(want),
+                "label {label}"
+            );
+        }
+        assert!(reasoning_label_to_effort("bogus").is_none());
+    }
+
+    #[test]
+    fn reasoning_choices_are_model_aware() {
+        // Non-xAI models get normal/low/medium/high, never max.
+        let base = reasoning_choices("gpt-5-codex", "openai");
+        assert_eq!(
+            base,
+            vec!["normal (model default)", "low", "medium", "high"]
+        );
+        // Even the free Gemini preset stays forthright — the endpoint
+        // ignores reasoning_effort entirely but the picker still offers
+        // the portable levels only.
+        assert!(reasoning_choices("gemini-3.5-flash", "gemini")
+            .iter()
+            .all(|c| c != "max"));
+        // Grok models (and the xai provider preset) unlock max.
+        assert!(reasoning_choices("grok-3.5-reasoner", "xai").contains(&"max".to_string()));
+        assert!(reasoning_choices("grok-4", "tokenrouter").contains(&"max".to_string()));
+        assert!(reasoning_choices("something-else", "xai").contains(&"max".to_string()));
+    }
+
+    #[test]
+    fn cli_verification_skips_local_servers_without_network() {
+        let p = Provider {
+            base_url: "http://localhost:11434/v1".into(),
+            api_key: String::new(),
+            kind: "openai".into(),
+            model: "qwen2.5-coder:7b".into(),
+            headers: Default::default(),
+            reasoning_effort: None,
+        };
+        assert!(
+            verify_provider_creds(&p).is_ok(),
+            "local URLs skip the probe"
+        );
+    }
+
+    #[test]
+    fn default_mode_is_build() {
+        let dir = std::env::temp_dir().join(format!("lc-defmode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Fully specified endpoint so resolution never touches env vars.
+        let args = (
+            Some("t"),
+            Some("http://localhost:9/v1"),
+            Some("k"),
+            Some("m"),
+        );
+        let app = App::build_with_config(
+            dir.clone(),
+            Config::default(),
+            args.0,
+            args.1,
+            args.2,
+            args.3,
+            None,
+        )
+        .expect("app builds");
+        assert_eq!(
+            app.agent.mode,
+            ApprovalMode::AutoEdit,
+            "BUILD is the default mode"
+        );
+        // Explicit config still wins over the default.
+        let cfg = Config {
+            approval_mode: Some("suggest".into()),
+            ..Default::default()
+        };
+        let app = App::build_with_config(dir, cfg, args.0, args.1, args.2, args.3, None).unwrap();
+        assert_eq!(app.agent.mode, ApprovalMode::Suggest);
+    }
+
+    #[test]
+    fn worker_cancel_interrupts_a_stalled_stream() {
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+
+        let _guard = crate::session::test_sync::env_lock();
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("interrupt-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let previous = std::env::var_os("LAUDACODE_SESSIONS_DIR");
+        std::env::set_var("LAUDACODE_SESSIONS_DIR", dir.join("sessions"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut socket = loop {
+                if let Ok((socket, _)) = listener.accept() {
+                    break socket;
+                }
+                if Instant::now() >= deadline {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 4096];
+            loop {
+                let n = socket.read(&mut buf).unwrap();
+                if n == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            socket
+                .write_all(
+                    concat!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"stream started\"}}]}\n\n"
+            )
+                    .as_bytes(),
+                )
+                .unwrap();
+            // Hold the stream open without sending another byte.
+            let _ = stop_rx.recv_timeout(Duration::from_secs(10));
+        });
+        let app = App::build_with_config(
+            dir.clone(),
+            Config::default(),
+            Some("test"),
+            Some(&url),
+            Some("test-key"),
+            Some("test-model"),
+            None,
+        )
+        .unwrap();
+        let worker = spawn_worker(app);
+        worker
+            .cmd
+            .send(WorkerCmd::Submit("test cancellation".into()))
+            .unwrap();
+        let mut streaming = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Ok(WorkerEvent::Ev(AgentEvent::Content(_))) =
+                worker.events.recv_timeout(Duration::from_millis(100))
+            {
+                streaming = true;
+                break;
+            }
+        }
+        worker.cancel.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut interrupted = false;
+        let mut idle = false;
+        while Instant::now() < deadline {
+            match worker.events.recv_timeout(Duration::from_millis(100)) {
+                Ok(WorkerEvent::Info(s)) if s == "interrupted" => interrupted = true,
+                Ok(WorkerEvent::Busy(false)) => {
+                    idle = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        // Unblock and shut down even when the regression is present.
+        let _ = stop_tx.send(());
+        server.join().unwrap();
+        worker.cmd.send(WorkerCmd::Quit).unwrap();
+        while worker.events.recv_timeout(Duration::from_secs(5)).is_ok() {}
+        match previous {
+            Some(value) => std::env::set_var("LAUDACODE_SESSIONS_DIR", value),
+            None => std::env::remove_var("LAUDACODE_SESSIONS_DIR"),
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(streaming, "mock stream must reach the worker");
+        assert!(
+            interrupted && idle,
+            "UI cancellation must stop a stalled worker stream promptly"
+        );
+    }
+
+    #[test]
+    fn skill_picker_selection_stages_composer_prompt() {
+        let mut tui = Tui::new();
+        apply_skill_selection(&mut tui, "release-notes — Write release notes");
+        assert_eq!(tui.input, "Use the 'release-notes' skill — ");
+        apply_skill_selection(&mut tui, "minimal — (no description)");
+        assert_eq!(
+            tui.input,
+            "Use the 'release-notes' skill — Use the 'minimal' skill — "
+        );
+    }
+
+    #[test]
+    fn skills_command_dispatches_without_submitting_a_prompt() {
+        let mut tui = Tui::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(handle_slash(&mut tui, &tx, "/skills"));
+        assert!(matches!(rx.try_recv().unwrap(), WorkerCmd::ListSkills));
+        assert!(rx.try_recv().is_err());
+        assert!(handle_slash(&mut tui, &tx, "/skills unexpected"));
+        assert!(rx.try_recv().is_err());
+        assert!(
+            matches!(tui.entries.last(), Some(Entry::Error(s)) if s.contains("usage: /skills"))
+        );
+        assert!(handle_slash(&mut tui, &tx, "/help"));
+        assert!(matches!(tui.entries.last(), Some(Entry::Info(s)) if s.contains("/skills")));
+    }
+
+    #[test]
+    fn prompt_history_roundtrips_through_disk() {
+        // Same lock as session tests — both flip LAUDACODE_SESSIONS_DIR.
+        let _g = crate::session::test_sync::env_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "lc-hist-{}-{}",
+            std::process::id(),
+            std::time::Instant::now().elapsed().as_nanos()
+        ));
+        std::env::set_var("LAUDACODE_SESSIONS_DIR", &dir);
+        // Isolated dir starts empty.
+        assert!(load_prompt_history().is_empty());
+        append_prompt_history("first task");
+        append_prompt_history("second task");
+        append_prompt_history("   ");
+        assert_eq!(load_prompt_history(), vec!["first task", "second task"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn restored_sessions_replay_into_visible_transcript() {
+        // A realistic stored conversation: user ask → tool call → result → answer.
+        let msgs = vec![
+            Message::system("system prompt"),
+            Message::user("fix the build"),
+            Message::assistant_with_tools(
+                vec![crate::api::ToolCall {
+                    id: "call_0".into(),
+                    kind: "function".into(),
+                    function: crate::api::FunctionCall {
+                        name: "run_command".into(),
+                        arguments: r#"{"command":"cargo build"}"#.into(),
+                    },
+                    extra_content: None,
+                }],
+                None,
+            ),
+            Message::tool_result("call_0", "[exit: 0]\nFinished dev profile"),
+            Message::assistant("Fixed — one missing import."),
+        ];
+        let entries = transcript_entries(&msgs);
+        let kinds: Vec<String> = entries
+            .iter()
+            .map(|e| match e {
+                Entry::User(_) => "user".into(),
+                Entry::Assistant(t) => format!("assistant:{t}"),
+                Entry::ToolCall { name, .. } => format!("call:{name}"),
+                Entry::ToolResult { name, ok, .. } => format!("result:{name}:{ok}"),
+                _ => "other".into(),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "user",
+                "call:run_command",
+                "result:run_command:true",
+                "assistant:Fixed — one missing import.",
+            ],
+            "{kinds:?}"
+        );
+        // System prompts and housekeeping markers never leak on screen.
+        let with_markers = vec![
+            Message::user(
+                "[Resuming previous session above. Continue where it left off.]".to_string(),
+            ),
+            Message::user("real question"),
+        ];
+        let replay = transcript_entries(&with_markers);
+        assert_eq!(replay.len(), 1);
+    }
+
+    #[test]
+    fn placeholder_keys_are_flagged() {
+        for k in ["", "<key>", "sk-test-invalid", "changeme", "YOUR-KEY"] {
+            assert!(placeholder_key(k), "should flag: {k}");
+        }
+        // A real-looking OpenRouter key must not be flagged.
+        assert!(!placeholder_key("sk-or-v1-abc123def4567890"));
+    }
+}
