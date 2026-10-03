@@ -19,7 +19,7 @@ else
     PREFIX="${PREFIX:-/usr/local}"
     TMPDIR="${TMPDIR:-/tmp}"
 fi
-REPO="${REPO:-Anon4You/Laudacode}"
+REPO="${REPO:-danz565/Laudacode}"
 BUILD_DIR="$TMPDIR/laudacode-build"
 
 # --- dependencies needed in all paths ---------------------------------------------
